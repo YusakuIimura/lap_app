@@ -5,16 +5,14 @@ import sys
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    # 1つのウィンドウでページを切替えるためのスタック
+    # ページスタック
     stacked = QStackedWidget()
 
-    # MainWindow を作ってスタックに追加
     main_page = MainWindow(stacked)
-    stacked.addWidget(main_page)           # index 0
+    stacked.addWidget(main_page) # index 0
 
-    # 初期表示は MainWindow
     stacked.setCurrentIndex(0)
-    stacked.resize(800, 600)
+    stacked.resize(1200, 800)
     stacked.show()
 
     sys.exit(app.exec_())

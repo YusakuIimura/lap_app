@@ -49,7 +49,7 @@ class DataFrameModel(QAbstractTableModel):
             if pd.isna(val):
                 return ""
 
-            # --- pandas.Timestamp / datetime.datetime / numpy.datetime64 → 時刻だけ表示 ---
+            # 時刻だけ表示
             if isinstance(val, pd.Timestamp):
                 ms = val.microsecond // 1000
                 return val.strftime("%H:%M:%S") if ms == 0 else val.strftime("%H:%M:%S.%f")[:-3]
@@ -65,7 +65,6 @@ class DataFrameModel(QAbstractTableModel):
                 ms = ts.microsecond // 1000
                 return ts.strftime("%H:%M:%S") if ms == 0 else ts.strftime("%H:%M:%S.%f")[:-3]
 
-            # --- pandas.Timedelta → mm:ss.mmm 表示（負号対応）---
             if isinstance(val, pd.Timedelta):
                 total_ms = int(val / pd.Timedelta(milliseconds=1))
                 sign = "-" if total_ms < 0 else ""
@@ -74,10 +73,9 @@ class DataFrameModel(QAbstractTableModel):
                 seconds, ms = divmod(rem, 1000)
                 return f"{sign}{minutes:02d}:{seconds:02d}.{ms:03d}"
 
-            # それ以外は通常表示
             return str(val)
 
-        # ② 補完セルなら赤字
+        # 補完セルなら赤字
         if role == Qt.ForegroundRole and self._mask is not None:
             try:
                 if bool(self._mask.iat[index.row(), index.column()]):
@@ -85,7 +83,7 @@ class DataFrameModel(QAbstractTableModel):
             except Exception:
                 pass    
 
-        # ③ 編集用値（既存通り）
+        # ③ 編集用
         if role == Qt.EditRole:
             return "" if pd.isna(val) else val
 
@@ -127,7 +125,6 @@ class RangeFilterProxy(QSortFilterProxyModel):
             col_idx = self.column_names.index(col_name)
             idx = model.index(source_row, col_idx)
             text = model.data(idx, Qt.DisplayRole)
-            # 空や非数値は、レンジ指定がある時は落とす・無い時は通す
             try:
                 val = float(text) if text not in (None, "") else math.nan
             except Exception:
@@ -146,15 +143,15 @@ class KPIPage(QWidget):
         super().__init__()
         self.stacked_widget = stacked_widget
 
-        self.setWindowTitle("KPI 表示")
+        self.setWindowTitle("Display KPIs")
         self.resize(980, 640)
 
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("KPI結果（数値レンジフィルタ対応）"))
+        layout.addWidget(QLabel("KPIs"))
 
-        # ▼ 追加: 全列表示トグル（初期ON=デバッグ表示）
-        self.debug_all_cols = QCheckBox("全列表示（デバッグ）")
-        self.debug_all_cols.setChecked(True)  # まずは制限なしで確認したいという要望に沿う
+        # 全列表示トグル
+        self.debug_all_cols = QCheckBox("Show All Columns")
+        self.debug_all_cols.setChecked(True)  
         layout.addWidget(self.debug_all_cols)
 
         # --- DB取得（クエリは変更しない）---
@@ -163,12 +160,8 @@ class KPIPage(QWidget):
         df_any["__row_id"] = range(len(df_any))
         self.df_all = df_any   
 
-        # ▼ 元データは保持（切替で使い回す）
+        # ▼ 元データは保持
         self.df_all = df_any.copy()
-
-        # ▼ Time100→200 の表記ゆれ（utils側が "Time1000to200" を生成）に当面対応
-        #   表示やフィルタ指定では "Time100to200" をラベルとして使い、
-        #   実体が存在すれば "Time1000to200" を参照する
         self.alias_map = {"Time100to200": "Time100to200"}
 
         # 必要列の補完（無ければ NaN/空文字を立てておく）
@@ -199,15 +192,15 @@ class KPIPage(QWidget):
             self.min_edits[real_col_name] = min_edit
             self.max_edits[real_col_name] = max_edit
 
-        # 実体の列名（存在すれば alias を解決）
+        # 実体の列名
         def resolve(col_name, columns):
             cand = self.alias_map.get(col_name, col_name)
-            return cand if cand in columns else col_name  # 無ければ元名のまま（後段でガード済）
+            return cand if cand in columns else col_name
 
         add_min_max_row("Entry Speed",  resolve("entry_speed",  self.df_all.columns))
         add_min_max_row("Jump Speed",   resolve("jump_speed",   self.df_all.columns))
         add_min_max_row("Time 000→100", resolve("Time000to100", self.df_all.columns))
-        add_min_max_row("Time 100→200", resolve("Time100to200", self.df_all.columns))  # 実体は Time1000to200 かも
+        add_min_max_row("Time 100→200", resolve("Time100to200", self.df_all.columns))
         add_min_max_row("Time 000→200", resolve("Time000to200", self.df_all.columns))
 
         layout.addLayout(form)
@@ -238,8 +231,8 @@ class KPIPage(QWidget):
         layout.addWidget(self.table)
         
         # ボタン類
-        btn_row_delete = QPushButton("選択行を削除")
-        btn_export_csv = QPushButton("CSVエクスポート（現在の表示）")
+        btn_row_delete = QPushButton("Delete selected rows")
+        btn_export_csv = QPushButton("Eport to CSV")
         btn_row_delete.clicked.connect(self.delete_selected_rows)
         btn_export_csv.clicked.connect(self.export_current_view_to_csv)
         btn_box = QHBoxLayout()
@@ -254,7 +247,7 @@ class KPIPage(QWidget):
         self.debug_all_cols.stateChanged.connect(lambda _s: self._rebuild_table(self.debug_all_cols.isChecked()))
 
         # 戻る
-        back_btn = QPushButton("← 戻る（メインへ）")
+        back_btn = QPushButton("← Back to Main")
         back_btn.clicked.connect(self.go_back)
         layout.addWidget(back_btn)
 
@@ -304,7 +297,6 @@ class KPIPage(QWidget):
         )
 
         # 5) 行単位・複数選択を許可（毎回設定してOK）
-        from PyQt5.QtWidgets import QAbstractItemView, QTableView
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
  
@@ -319,12 +311,12 @@ class KPIPage(QWidget):
     def delete_selected_rows(self):
         sel = self.table.selectionModel().selectedRows()
         if not sel:
-            QMessageBox.information(self, "削除", "削除する行を選択してください。")
+            QMessageBox.information(self, "Delet", "Please select rows to delete")
             return
 
         if QMessageBox.question(
-            self, "削除の確認",
-            f"{len(sel)} 行を削除します。よろしいですか？",
+            self, "Delete Rows",
+            f"{len(sel)} rows will be deleted. Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         ) != QMessageBox.Yes:
             return
@@ -343,7 +335,7 @@ class KPIPage(QWidget):
         
     def export_current_view_to_csv(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "CSVを保存", "kpi_export.csv", "CSV Files (*.csv)"
+            self, "Save CSV", "kpi_export.csv", "CSV Files (*.csv)"
         )
         if not path:
             return
@@ -362,7 +354,7 @@ class KPIPage(QWidget):
 
         try:
             export_df.to_csv(path, index=False, encoding="utf-8-sig")
-            QMessageBox.information(self, "エクスポート", f"CSVを保存しました:\n{path}")
+            QMessageBox.information(self, "Export", f"CSV Saved:\n{path}")
         except Exception as e:
-            QMessageBox.warning(self, "エクスポート失敗", f"保存に失敗しました:\n{e}")
+            QMessageBox.warning(self, "Export Failed", f"Save failed:\n{e}")
         

@@ -10,12 +10,12 @@ import mysql.connector
 from utils import get_df_from_db
 
 class MainWindow(QWidget):
-    def __init__(self, stacked_widget):  # ← 引数追加
+    def __init__(self, stacked_widget):
         super().__init__()
-        self.stacked_widget = stacked_widget  # ← スタック保持
+        self.stacked_widget = stacked_widget
 
-        self.setWindowTitle("KPIアプリ")
-        self.resize(600, 400)
+        self.setWindowTitle("Lap Time Visualizer")
+        self.resize(1200, 800)
 
         self.layout = QVBoxLayout()
 
@@ -26,12 +26,12 @@ class MainWindow(QWidget):
         self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         
-        self.layout.addWidget(QLabel("開始日時"))
+        self.layout.addWidget(QLabel("Start Date"))
         self.layout.addWidget(self.start_datetime)
-        self.layout.addWidget(QLabel("終了日時"))
+        self.layout.addWidget(QLabel("End Date"))
         self.layout.addWidget(self.end_datetime)
 
-        self.search_btn = QPushButton("選手一覧を取得")
+        self.search_btn = QPushButton("Get players list")
         self.search_btn.clicked.connect(self.load_players)
         self.layout.addWidget(self.search_btn)
 
@@ -39,7 +39,7 @@ class MainWindow(QWidget):
         self.player_list.setSelectionMode(QListWidget.MultiSelection)
         self.layout.addWidget(self.player_list)
 
-        self.kpi_btn = QPushButton("KPIを表示")
+        self.kpi_btn = QPushButton("Show KPIs")
         self.kpi_btn.clicked.connect(self.show_kpi)
         self.layout.addWidget(self.kpi_btn)
 
@@ -62,13 +62,13 @@ class MainWindow(QWidget):
         for _, row in df.iterrows():
             name = f"{row['last_name']} {row['first_name']} ({row['id']})"
             item = QListWidgetItem(name)
-            item.setData(1, row['id'])  # user_id
+            item.setData(1, row['id'])
             self.player_list.addItem(item)
 
     def show_kpi(self):
         selected_ids = [item.data(1) for item in self.player_list.selectedItems()]
         if not selected_ids:
-            QMessageBox.warning(self, "選手未選択", "少なくとも1人選手を選んでください。")
+            QMessageBox.warning(self, "Player Unselected", "Please select at least one player")
             return
 
         start = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
@@ -97,7 +97,7 @@ class MainWindow(QWidget):
         LIMIT 10000;
         """
 
-        # ここを別ウィンドウではなくスタック遷移に変更
+        # ページ遷移
         kpi_page = KPIPage(query, self.stacked_widget)
-        self.stacked_widget.addWidget(kpi_page)   # 末尾に追加（indexは可変）
+        self.stacked_widget.addWidget(kpi_page)
         self.stacked_widget.setCurrentWidget(kpi_page)
