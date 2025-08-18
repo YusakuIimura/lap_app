@@ -1,7 +1,8 @@
 # kpi_page.py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
-    QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox
+    QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox,
+    QAbstractItemView, QMessageBox,QFileDialog,
 )
 from PyQt5.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel
@@ -158,6 +159,9 @@ class KPIPage(QWidget):
 
         # --- DB取得（クエリは変更しない）---
         df_any, _users = fetch_df_from_db(query)
+        df_any = df_any.copy()
+        df_any["__row_id"] = range(len(df_any))
+        self.df_all = df_any   
 
         # ▼ 元データは保持（切替で使い回す）
         self.df_all = df_any.copy()
@@ -232,6 +236,16 @@ class KPIPage(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table)
+        
+        # ボタン類
+        btn_row_delete = QPushButton("選択行を削除")
+        btn_export_csv = QPushButton("CSVエクスポート（現在の表示）")
+        btn_row_delete.clicked.connect(self.delete_selected_rows)
+        btn_export_csv.clicked.connect(self.export_current_view_to_csv)
+        btn_box = QHBoxLayout()
+        btn_box.addWidget(btn_row_delete)
+        btn_box.addWidget(btn_export_csv)
+        layout.addLayout(btn_box)
 
         # ▼ 表の初期構築（デバッグ=全列表示）
         self._rebuild_table(show_all=True)
@@ -248,29 +262,51 @@ class KPIPage(QWidget):
 
     # ▼ 表の作り直し（全列 or 標準列）
     def _rebuild_table(self, show_all: bool):
-        # 1) 表示列（imputed__* は表示しない）
-        if show_all:
-            cols = [c for c in self.df_all.columns if not c.startswith("imputed__")]
-        else:
-            cols = [c for c in DISPLAY_COLUMNS if c in self.df_all.columns and not c.startswith("imputed__")]
-            if not cols:
-                cols = [c for c in self.df_all.columns if not c.startswith("imputed__")]
+        # --- 安全策：__row_id が無ければ今ある行数で採番 ---
+        if "__row_id" not in self.df_all.columns:
+            self.df_all = self.df_all.copy()
+            self.df_all["__row_id"] = range(len(self.df_all))
 
+        # 1) 表示列（imputed__* と __row_id は表示しない）
+        if show_all:
+            cols = [c for c in self.df_all.columns
+                    if not (c.startswith("imputed__") or c == "__row_id")]
+        else:
+            cols = [c for c in DISPLAY_COLUMNS
+                    if c in self.df_all.columns and not (c.startswith("imputed__") or c == "__row_id")]
+            if not cols:
+                cols = [c for c in self.df_all.columns
+                        if not (c.startswith("imputed__") or c == "__row_id")]
+
+        # 表示用DF（indexは元のindexを保持 → 行IDマップに使う）
         df_view = self.df_all[cols].copy()
 
-        # 2) マスクを組み立て
-        mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
-        for c in cols:
-            fcol = f"imputed__{c}"
-            if fcol in self.df_all.columns:
-                mask_view[c] = self.df_all[fcol].astype(bool).reindex(df_view.index).values
+        # 2) 赤字用マスクを作成（存在する imputed__{列} を拾う）
+        mask_view = None
+        flag_map = {c: f"imputed__{c}" for c in cols}
+        if any(fc in self.df_all.columns for fc in flag_map.values()):
+            import pandas as pd
+            mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
+            for c, fc in flag_map.items():
+                if fc in self.df_all.columns:
+                    mask_view[c] = self.df_all[fc].astype(bool).reindex(df_view.index).values
 
-        # 3) モデルへ
+        # 3) モデル／プロキシへ
         self.model = DataFrameModel(df_view, mask_view)
         self.proxy = RangeFilterProxy(cols)
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
 
+        # 4) 行IDマップ（ソース行 idx -> row_id）
+        #    ※ df_view.index は self.df_all の index と一致しているのでそれ経由で取得
+        self._row_id_per_source_row = (
+            self.df_all.loc[df_view.index, "__row_id"].reset_index(drop=True).tolist()
+        )
+
+        # 5) 行単位・複数選択を許可（毎回設定してOK）
+        from PyQt5.QtWidgets import QAbstractItemView, QTableView
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
  
     def go_back(self):
         """メインに戻る。動的に積み上がるのを避けるため、このページをスタックから外す。"""
@@ -279,3 +315,54 @@ class KPIPage(QWidget):
         if idx != -1:
             sw.removeWidget(self)
         sw.setCurrentIndex(0)
+        
+    def delete_selected_rows(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "削除", "削除する行を選択してください。")
+            return
+
+        if QMessageBox.question(
+            self, "削除の確認",
+            f"{len(sel)} 行を削除します。よろしいですか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) != QMessageBox.Yes:
+            return
+
+        # プロキシ行 → ソース行 → __row_id に変換
+        source_rows = sorted({ self.proxy.mapToSource(i).row() for i in sel })
+        target_ids  = [ self._row_id_per_source_row[r] for r in source_rows ]
+
+        # 元DFから該当IDを削除
+        self.df_all.drop(self.df_all.index[self.df_all["__row_id"].isin(target_ids)],
+                        inplace=True)
+        self.df_all.reset_index(drop=True, inplace=True)
+
+        # 再構築（行IDは再採番しない＝残ったIDはそのまま）
+        self._rebuild_table(self.debug_all_cols.isChecked() if hasattr(self, "debug_all_cols") else True)
+        
+    def export_current_view_to_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "CSVを保存", "kpi_export.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+
+        # プロキシ（フィルタ後）の行を順にソース行へ写像
+        src_rows = [ self.proxy.mapToSource(self.proxy.index(r, 0)).row()
+                    for r in range(self.proxy.rowCount()) ]
+
+        # ソース（モデル）の可視列を丸ごと抽出
+        export_df = self.model._df.iloc[src_rows].copy()
+
+        # 内部列があれば除外（保険）
+        drop_cols = [c for c in export_df.columns if c.startswith("imputed__")] + ["__row_id"]
+        export_df.drop(columns=[c for c in drop_cols if c in export_df.columns],
+                    inplace=True, errors="ignore")
+
+        try:
+            export_df.to_csv(path, index=False, encoding="utf-8-sig")
+            QMessageBox.information(self, "エクスポート", f"CSVを保存しました:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "エクスポート失敗", f"保存に失敗しました:\n{e}")
+        
