@@ -6,23 +6,54 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QDateTime
 from kpi_page import KPIPage
 import sys
-import mysql.connector
 from utils import get_df_from_db
+import os
+import json
+
+# setting読み取り
+SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
+
+def _load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_json(path, obj):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
 class MainWindow(QWidget):
     def __init__(self, stacked_widget):
         super().__init__()
         self.stacked_widget = stacked_widget
+        self.start_datetime = QDateTimeEdit()
+        self.end_datetime = QDateTimeEdit()
 
         self.setWindowTitle("Lap Time Visualizer")
         self.resize(1200, 800)
+        
+        # 設定ロード＆初期値適用
+        self._settings = _load_json(SETTINGS_PATH)
+        ui_cfg = self._settings.get("ui", {})
+        sd = ui_cfg.get("start_datetime")
+        ed = ui_cfg.get("end_datetime")
+        if isinstance(sd, str):
+            dt = QDateTime.fromString(sd, "yyyy-MM-dd HH:mm:ss")
+            if dt.isValid():
+                self.start_datetime.setDateTime(dt)
+        if isinstance(ed, str):
+            dt = QDateTime.fromString(ed, "yyyy-MM-dd HH:mm:ss")
+            if dt.isValid():
+                self.end_datetime.setDateTime(dt)
 
         self.layout = QVBoxLayout()
 
-        self.start_datetime = QDateTimeEdit()
-        self.end_datetime = QDateTimeEdit()
-        self.start_datetime.setDateTime(QDateTime.fromString("2025-06-29 00:00:00", "yyyy-MM-dd HH:mm:ss"))
-        self.end_datetime.setDateTime(QDateTime.fromString("2025-06-30 23:59:59", "yyyy-MM-dd HH:mm:ss"))
+
+        # self.start_datetime.setDateTime(QDateTime.fromString("2025-06-29 00:00:00", "yyyy-MM-dd HH:mm:ss"))
+        # self.end_datetime.setDateTime(QDateTime.fromString("2025-06-30 23:59:59", "yyyy-MM-dd HH:mm:ss"))
         self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         
@@ -44,6 +75,10 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.kpi_btn)
 
         self.setLayout(self.layout)
+        
+        # 変更されたら即保存
+        self.start_datetime.dateTimeChanged.connect(self._persist_dates)
+        self.end_datetime.dateTimeChanged.connect(self._persist_dates)
 
     def load_players(self):
         start = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
@@ -59,6 +94,9 @@ class MainWindow(QWidget):
         """
         df = get_df_from_db(query)
         self.player_list.clear()
+        if df.empty:
+           QMessageBox.information(self, "No players", "No players found for the specified period. Please change the period and search again.")
+           return
         for _, row in df.iterrows():
             name = f"{row['last_name']} {row['first_name']} ({row['id']})"
             item = QListWidgetItem(name)
@@ -85,10 +123,15 @@ class MainWindow(QWidget):
             tu.user_id
         FROM 
             passing p
-        JOIN 
-            transponder_user tu ON p.transponder_id = tu.transponder_id
-        JOIN 
-            user u ON tu.user_id = u.id
+        JOIN (
+            SELECT id, transponder_id, user_id
+            FROM transponder_user
+            WHERE user_id IN ({ids_str})
+            AND since <= '{start}'
+            AND (until IS NULL OR until > '{start}')
+        ) tu
+        ON tu.transponder_id = p.transponder_id
+        JOIN `user` u ON u.id = tu.user_id
         WHERE 
             p.timestamp BETWEEN '{start}' AND '{end}'
             AND tu.user_id IN ({ids_str})
@@ -101,3 +144,11 @@ class MainWindow(QWidget):
         kpi_page = KPIPage(query, self.stacked_widget)
         self.stacked_widget.addWidget(kpi_page)
         self.stacked_widget.setCurrentWidget(kpi_page)
+
+    def _persist_dates(self):
+        sd = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        ed = self.end_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        self._settings.setdefault("ui", {})
+        self._settings["ui"]["start_datetime"] = sd
+        self._settings["ui"]["end_datetime"] = ed
+        _save_json(SETTINGS_PATH, self._settings)

@@ -1,10 +1,9 @@
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
+import os
+import json
 
-# ここはセキュリティ的に書き換えるべき
-PASS="cyvri5-Funcyb-cesfuk"
-USER="readonly"
 
 translate_dict ={
     '00042056': '100m',
@@ -42,6 +41,34 @@ SEGMENTS = [
     ("AP2",      "200m",     30.47),
     ("200m",     "FP_END",   32.03),
 ]
+
+SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
+
+def _load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _get_db_url_from_settings():
+    s = _load_json(SETTINGS_PATH)
+    db = s.get("db", {})
+    # 直接URL指定があればそれを使う（例: "mysql+pymysql://user:pass@host/db?charset=utf8mb4"）
+    if "url" in db and db["url"]:
+        return db["url"]
+    # 個別指定（driver/host/port/name/user/pass）から組み立て
+    driver = db.get("driver", "mysql+pymysql")
+    host   = db.get("host", "127.0.0.1")
+    port   = int(db.get("port", 3306))
+    name   = db.get("name")  # DB名
+    user   = db.get("user")
+    passwd = db.get("pass")
+    if not all([name, user, passwd]):
+        raise RuntimeError("setting.json の db.name / db.user / db.pass を設定してください。")
+    return f"{driver}://{user}:{passwd}@{host}:{port}/{name}"
+
+
 
 def _build_distance_map():
     """SEGMENTSから列順と累積距離[m]を算出"""
@@ -115,21 +142,8 @@ for a, b, d in SEGMENTS:
     CUM_DIST[b] = _total
 LAP_LENGTH = CUM_DIST["FP_END"]
 
-# EC2経由でDBへアクセス
-# def get_df_from_db(query, database="trackview"):
-#     engine = create_engine(
-#         f"mysql+pymysql://{USER}:{PASS}@127.0.0.1:3307/{database}"
-#     )
-#     with engine.connect() as conn:
-#         df = pd.read_sql(query, conn)
-#     return df
-
-def get_df_from_db(query, database="trackview"):
-    host = "trackview-instance-1.chakc5iaoqqz.ap-northeast-1.rds.amazonaws.com"
-    port = 3306
-    engine = create_engine(
-        f"mysql+pymysql://{USER}:{PASS}@{host}:{port}/{database}"
-    )
+def get_df_from_db(query):
+    engine = create_engine(_get_db_url_from_settings(), pool_pre_ping=True)
     with engine.connect() as conn:
         df = pd.read_sql(query, conn)
     return df
@@ -205,7 +219,7 @@ def split_laps(df):
             continue
 
         # 内側ポイント：最初の観測だけ記録
-        if pos in inner_pts and cur[pos] is None:
+        if anchor is not None and pos in inner_pts and cur[pos] is None:
             cur[pos] = ts
 
     # 末尾も確定
@@ -248,24 +262,26 @@ def split_laps(df):
     return out
 
 def calculate_entry_speed(row):
-    l = 17.97  # 0m-FP間距離（m）
-    t1, t2 = row.get("0m_start"), row.get("FP_start")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(l / td.total_seconds() * 3.6, 2)  # km/h
+    # l = 17.97  # 0m-FP間距離（m）
+    # t1, t2 = row.get("0m_start"), row.get("FP_start")
+    # if pd.isna(t1) or pd.isna(t2):
+    #     return np.nan
+    # td = t1 - t2
+    # if pd.isna(td) or td.total_seconds() == 0:
+    #     return np.nan
+    # return round(l / td.total_seconds() * 3.6, 2)  # km/h
+    return ''
 
 def calculate_jump_speed(row):
-    l = 17.97 + 50 - 250 / 4  # 50m-AP1間距離（m）
-    t1, t2 = row.get("50m"), row.get("AP1")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(l / td.total_seconds() * 3.6, 2)  # km/h
+    # l = 17.97 + 50 - 250 / 4  # 50m-AP1間距離（m）
+    # t1, t2 = row.get("50m"), row.get("AP1")
+    # if pd.isna(t1) or pd.isna(t2):
+    #     return np.nan
+    # td = t1 - t2
+    # if pd.isna(td) or td.total_seconds() == 0:
+    #     return np.nan
+    # return round(l / td.total_seconds() * 3.6, 2)  # km/h
+    return ''
 
 def calculate_time_000_to_100(row):
     t1, t2 = row.get("150m"), row.get("50m")
@@ -293,6 +309,34 @@ def calculate_time_000_to_200(row):
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
     return round(td.total_seconds(), 2)
+
+def calculate_time_000_to_625(row):
+    t1, t2 = row.get("AP1"), row.get("FP_start")
+    if pd.isna(t1) or pd.isna(t2):
+        return np.nan
+    td = t1 - t2
+    if pd.isna(td) or td.total_seconds() == 0:
+        return np.nan
+    return round(td.total_seconds(), 2)
+
+def calculate_time_625_to_125(row):
+    t1, t2 = row.get("BP"), row.get("AP1")
+    if pd.isna(t1) or pd.isna(t2):
+        return np.nan
+    td = t1 - t2
+    if pd.isna(td) or td.total_seconds() == 0:
+        return np.nan
+    return round(td.total_seconds(), 2)
+
+def calculate_time_000_to_125(row):
+    t1, t2 = row.get("BP"), row.get("FP_start")
+    if pd.isna(t1) or pd.isna(t2):
+        return np.nan
+    td = t1 - t2
+    if pd.isna(td) or td.total_seconds() == 0:
+        return np.nan
+    return round(td.total_seconds(), 2)
+
 
 # utils.py 内：KPI計算の直後あたりに追加
 def _propagate_imputed_flags_to_kpi(df: pd.DataFrame) -> pd.DataFrame:
@@ -325,6 +369,7 @@ def fetch_df_from_db(query):
     "first_name", "last_name", "Date",
     "entry_speed", "jump_speed",
     "Time000to100", "Time100to200", "Time000to200",
+    "Time000to625", "Time625to125", "Time000to125",
     "FP_start", "0m_start", "60m", "AP1", "50m", "100m",
     "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd"
     ]
@@ -335,14 +380,22 @@ def fetch_df_from_db(query):
 
     for _, group in df.groupby("user_id"):
         group = group.sort_values(by=["timestamp"])
+        group.to_csv("debug_raw.csv", index=False)  # debug
         temp = split_laps(group)
+        temp.to_csv("debug.csv", index=False)  # debug
         temp = impute_times_by_distance(temp) # 保管処理
+        temp = temp.reset_index(drop=True)
+        temp["0m_2nd"] = temp["0m_start"].shift(-1)
+        temp["FP_2nd"] = temp["FP_first"].shift(-1) if "FP_first" in temp.columns else temp["FP_start"].shift(-1)
         temp["entry_speed"] = temp.apply(calculate_entry_speed, axis=1)
         temp["jump_speed"] = temp.apply(calculate_jump_speed, axis=1)
         temp["Time000to100"] = temp.apply(calculate_time_000_to_100, axis=1)
         temp["Time100to200"] = temp.apply(calculate_time_100_to_200, axis=1)
         temp["Time000to200"] = temp.apply(calculate_time_000_to_200, axis=1)
-        
+        temp["Time000to625"] = temp.apply(calculate_time_000_to_625, axis=1)
+        temp["Time625to125"] = temp.apply(calculate_time_625_to_125, axis=1)
+        temp["Time000to125"] = temp.apply(calculate_time_000_to_125, axis=1)
+                
         # 補間フラグ
         temp = _propagate_imputed_flags_to_kpi(temp)
         temp["first_name"] = group["first_name"].iloc[0]
@@ -355,26 +408,15 @@ def fetch_df_from_db(query):
 
     # すべてを1つの DataFrame にまとめる
     result_df = pd.concat(all_dfs, ignore_index=True)
-    return result_df,users
 
-    """
-    入力: 通過イベントの縦持ちDF（ユーザー・時系列・position 必須）
-    出力: 欠損地点を仮想行で補完した縦持ちDF（is_imputed 付き）
-    """
-    # 想定: df に position 列がある（decoder_id→position は事前に付与）
-    use_key = "user_id" if "user_id" in df.columns else "transponder_id"
-    df = df.sort_values(["first_name","last_name","timestamp"]).copy()
-    out_list = []
-    for _, g in df.groupby(use_key, dropna=False):
-        g = g.sort_values("timestamp")
-        g = _assign_lap_id(g)
-        for _, lap in g.groupby("lap_id"):
-            imputed = _impute_one_lap(lap)
-            if not imputed.empty:
-                out_list.append(imputed)
-    if not out_list:
-        # 何もできなければ空
-        return df.assign(is_imputed=False)
-    out = pd.concat(out_list, ignore_index=True)
-    out = out.sort_values(["first_name","last_name","timestamp"]).reset_index(drop=True)
-    return out
+    if not all_dfs:
+        # 期待カラムの空DFを返す（ダイアログや画面がそのまま動く）
+        imputed_bases = [
+            "FP_start","0m_start","60m","AP1","50m","100m",
+            "BP","150m","AP2","200m","FP_2nd","0m_2nd",
+            "entry_speed","jump_speed","Time000to100","Time100to200","Time000to200"
+        ]
+        empty_cols = DESIRED_ORDER + [f"imputed__{c}" for c in imputed_bases]
+        return pd.DataFrame(columns=empty_cols), users
+    
+    return result_df,users
