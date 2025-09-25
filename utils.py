@@ -3,7 +3,10 @@ import pandas as pd
 from sqlalchemy import create_engine
 import os
 import json
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import Callable, Optional
+import threading
 
 translate_dict ={
     '00042056': '100m',
@@ -68,6 +71,28 @@ def _get_db_url_from_settings():
         raise RuntimeError("setting.json の db.name / db.user / db.pass を設定してください。")
     return f"{driver}://{user}:{passwd}@{host}:{port}/{name}"
 
+def _noop(*args, **kwargs): pass
+
+def jst_str_to_utc_sql(ts_jst_str: str) -> str:
+    """
+    'YYYY-MM-DD HH:MM:SS' (JST) を UTC の同フォーマット文字列に変換。
+    SQLの BETWEEN / 比較に使う。
+    """
+    if not ts_jst_str:
+        return ts_jst_str
+    dt = datetime.strptime(ts_jst_str, "%Y-%m-%d %H:%M:%S")
+    jst = dt.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+    utc = jst.astimezone(ZoneInfo("UTC"))
+    return utc.strftime("%Y-%m-%d %H:%M:%S")
+
+def to_jst_naive(series: pd.Series) -> pd.Series:
+    """
+    Series内の日時を UTC として解釈 → JSTへ変換 → tzを外したnaiveに。
+    DBからUTCで来たtimestamp列に適用する想定。
+    """
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    s = s.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
+    return s
 
 
 def _build_distance_map():
@@ -364,53 +389,45 @@ def _propagate_imputed_flags_to_kpi(df: pd.DataFrame) -> pd.DataFrame:
         df[f"imputed__{kpi}"] = m
     return df
 
-def fetch_df_from_db(query):
+def fetch_df_from_db(
+    query: str,
+    progress: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+):
+    """
+    DB→前処理→split→補間→KPI→結合 を行う。
+    - progress(msg): 進捗メッセージをUIへ通知（未指定なら無視）
+    - cancel_event: .set() されていたら安全に中断（未指定なら無視）
+    戻り値: (result_df, users)
+    """
     DESIRED_ORDER = [
-    "first_name", "last_name", "Date",
-    "entry_speed", "jump_speed",
-    "Time000to100", "Time100to200", "Time000to200",
-    "Time000to625", "Time625to125", "Time000to125",
-    "FP_start", "0m_start", "60m", "AP1", "50m", "100m",
-    "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd"
+        "first_name", "last_name", "Date",
+        "entry_speed", "jump_speed",
+        "Time000to100", "Time100to200", "Time000to200",
+        "Time000to625", "Time625to125", "Time000to125",
+        "FP_start", "0m_start", "60m", "AP1", "50m", "100m",
+        "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd"
     ]
+
+    def _p(msg: str):
+        if progress:
+            try: progress(msg)
+            except Exception: pass
+
+    def _check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("CancelledByUser")
+
+    # 1) DB取得
+    _p("DB問い合わせ中…")
     df = get_df_from_db(query)
-    df["position"] = df["decoder_id"].map(translate_dict).fillna("Unknown")
-    users = df["first_name"].unique()
-    all_dfs = []
+    _check_cancel()
 
-    for _, group in df.groupby("user_id"):
-        group = group.sort_values(by=["timestamp"])
-        group.to_csv("debug_raw.csv", index=False)  # debug
-        temp = split_laps(group)
-        temp.to_csv("debug.csv", index=False)  # debug
-        temp = impute_times_by_distance(temp) # 保管処理
-        temp = temp.reset_index(drop=True)
-        temp["0m_2nd"] = temp["0m_start"].shift(-1)
-        temp["FP_2nd"] = temp["FP_first"].shift(-1) if "FP_first" in temp.columns else temp["FP_start"].shift(-1)
-        temp["entry_speed"] = temp.apply(calculate_entry_speed, axis=1)
-        temp["jump_speed"] = temp.apply(calculate_jump_speed, axis=1)
-        temp["Time000to100"] = temp.apply(calculate_time_000_to_100, axis=1)
-        temp["Time100to200"] = temp.apply(calculate_time_100_to_200, axis=1)
-        temp["Time000to200"] = temp.apply(calculate_time_000_to_200, axis=1)
-        temp["Time000to625"] = temp.apply(calculate_time_000_to_625, axis=1)
-        temp["Time625to125"] = temp.apply(calculate_time_625_to_125, axis=1)
-        temp["Time000to125"] = temp.apply(calculate_time_000_to_125, axis=1)
-                
-        # 補間フラグ
-        temp = _propagate_imputed_flags_to_kpi(temp)
-        temp["first_name"] = group["first_name"].iloc[0]
-        temp["last_name"] = group["last_name"].iloc[0]
-        imputed_cols = [c for c in temp.columns if c.startswith("imputed__")]
-        ordered_cols = DESIRED_ORDER + [c for c in imputed_cols if c not in DESIRED_ORDER]
-        temp = temp[ordered_cols]
-        
-        all_dfs.append(temp)
-
-    # すべてを1つの DataFrame にまとめる
-    result_df = pd.concat(all_dfs, ignore_index=True)
-
-    if not all_dfs:
-        # 期待カラムの空DFを返す（ダイアログや画面がそのまま動く）
+    # データ0件なら安全に返す
+    users = df["first_name"].unique() if "first_name" in df.columns else []
+    if df.empty:
+        _p("データ0件")
+        # 期待カラムの空DF（補間フラグ込み）を返す
         imputed_bases = [
             "FP_start","0m_start","60m","AP1","50m","100m",
             "BP","150m","AP2","200m","FP_2nd","0m_2nd",
@@ -418,5 +435,82 @@ def fetch_df_from_db(query):
         ]
         empty_cols = DESIRED_ORDER + [f"imputed__{c}" for c in imputed_bases]
         return pd.DataFrame(columns=empty_cols), users
-    
-    return result_df,users
+
+    # 2) タイムスタンプをJST（naive）へ
+    _p("タイムスタンプ変換中…")
+    if "timestamp" in df.columns:
+        df["timestamp"] = to_jst_naive(df["timestamp"])
+    _check_cancel()
+
+    # 3) デコーダ→地点名
+    _p("位置ラベル生成中…")
+    if "decoder_id" in df.columns:
+        df["position"] = df["decoder_id"].map(translate_dict).fillna("Unknown")
+    else:
+        df["position"] = "Unknown"
+    _check_cancel()
+
+    # 4) ユーザーごと処理
+    _p("ユーザーごとに集計中…")
+    all_dfs = []
+    group_key = "user_id" if "user_id" in df.columns else None
+    groups = df.groupby(group_key) if group_key else [(None, df)]
+
+    for uid, group in groups:
+        _check_cancel()
+        _p(f"ユーザー {uid if uid is not None else '-'}: split中…")
+        group = group.sort_values(by=["timestamp"]).reset_index(drop=True)
+
+        # --- split ---
+        temp = split_laps(group)
+
+        # --- 補間 ---
+        _p(f"ユーザー {uid if uid is not None else '-'}: 補間中…")
+        temp = impute_times_by_distance(temp)
+        temp = temp.reset_index(drop=True)
+
+        # --- 2nd 再計算 ---
+        temp["0m_2nd"] = temp["0m_start"].shift(-1)
+        temp["FP_2nd"] = temp["FP_first"].shift(-1) if "FP_first" in temp.columns else temp["FP_start"].shift(-1)
+
+        # --- KPI計算 ---
+        _p(f"ユーザー {uid if uid is not None else '-'}: KPI計算中…")
+        temp["entry_speed"]   = temp.apply(calculate_entry_speed, axis=1)
+        temp["jump_speed"]    = temp.apply(calculate_jump_speed, axis=1)
+        temp["Time000to100"]  = temp.apply(calculate_time_000_to_100, axis=1)
+        temp["Time100to200"]  = temp.apply(calculate_time_100_to_200, axis=1)
+        temp["Time000to200"]  = temp.apply(calculate_time_000_to_200, axis=1)
+        temp["Time000to625"]  = temp.apply(calculate_time_000_to_625, axis=1)
+        temp["Time625to125"]  = temp.apply(calculate_time_625_to_125, axis=1)
+        temp["Time000to125"]  = temp.apply(calculate_time_000_to_125, axis=1)
+
+        # --- 補間フラグ伝搬 & 氏名付与 ---
+        temp = _propagate_imputed_flags_to_kpi(temp)
+        if "first_name" in group.columns:
+            temp["first_name"] = group["first_name"].iloc[0]
+        if "last_name" in group.columns:
+            temp["last_name"]  = group["last_name"].iloc[0]
+
+        # 列整形（存在する imputed__* を末尾に）
+        imputed_cols = [c for c in temp.columns if c.startswith("imputed__")]
+        ordered_cols = [c for c in DESIRED_ORDER if c in temp.columns] + [c for c in imputed_cols if c not in DESIRED_ORDER]
+        temp = temp.reindex(columns=ordered_cols)
+
+        all_dfs.append(temp)
+
+    # 5) 結合（空安全）
+    if not all_dfs:
+        _p("集計結果0件")
+        imputed_bases = [
+            "FP_start","0m_start","60m","AP1","50m","100m",
+            "BP","150m","AP2","200m","FP_2nd","0m_2nd",
+            "entry_speed","jump_speed","Time000to100","Time100to200","Time000to200"
+        ]
+        empty_cols = DESIRED_ORDER + [f"imputed__{c}" for c in imputed_bases]
+        return pd.DataFrame(columns=empty_cols), users
+
+    _p("結合中…")
+    result_df = pd.concat(all_dfs, ignore_index=True)
+
+    _p("完了")
+    return result_df, users

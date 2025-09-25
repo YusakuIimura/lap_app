@@ -1,7 +1,7 @@
 # main_window.py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QDateEdit, QPushButton,
-    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit,QAbstractItemView
+    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit
 )
 from PyQt5.QtCore import QDateTime
 from kpi_page import KPIPage
@@ -10,6 +10,7 @@ from utils import get_df_from_db
 from utils import get_df_from_db, jst_str_to_utc_sql
 import os
 import json
+import time
 
 # setting読み取り
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
@@ -68,7 +69,7 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.search_btn)
 
         self.player_list = QListWidget()
-        self.player_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.player_list.setSelectionMode(QListWidget.MultiSelection)
         self.layout.addWidget(self.player_list)
 
         self.kpi_btn = QPushButton("Show KPIs")
@@ -95,7 +96,12 @@ class MainWindow(QWidget):
         AND p.timestamp BETWEEN tu.since AND tu.until
         ORDER BY u.last_name, u.first_name;
         """
+        print("[Players] クエリ送信中…")
+        t0 = time.perf_counter()
         df = get_df_from_db(query)
+        t1 = time.perf_counter()
+        print(f"[Players] 取得完了: {len(df)} 行 / {t1 - t0:.2f}s")
+        
         self.player_list.clear()
         if df.empty:
            QMessageBox.information(self, "No players", "No players found for the specified period. Please change the period and search again.")

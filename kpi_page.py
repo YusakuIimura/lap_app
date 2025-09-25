@@ -211,7 +211,7 @@ class KPIPage(QWidget):
         layout.addLayout(row_top)
 
         # --- DB取得 ---
-        df_any, _users = fetch_df_from_db(query)
+        df_any, _users = fetch_df_from_db(query, progress=lambda m: print(f"[KPI] {m}"))
         df_any = df_any.copy()
         if "__row_id" not in df_any.columns:
             df_any["__row_id"] = range(len(df_any))
