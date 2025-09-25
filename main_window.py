@@ -1,12 +1,13 @@
 # main_window.py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QDateEdit, QPushButton,
-    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit
+    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit,QAbstractItemView
 )
 from PyQt5.QtCore import QDateTime
 from kpi_page import KPIPage
 import sys
 from utils import get_df_from_db
+from utils import get_df_from_db, jst_str_to_utc_sql
 import os
 import json
 
@@ -67,7 +68,7 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.search_btn)
 
         self.player_list = QListWidget()
-        self.player_list.setSelectionMode(QListWidget.MultiSelection)
+        self.player_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.layout.addWidget(self.player_list)
 
         self.kpi_btn = QPushButton("Show KPIs")
@@ -81,14 +82,16 @@ class MainWindow(QWidget):
         self.end_datetime.dateTimeChanged.connect(self._persist_dates)
 
     def load_players(self):
-        start = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
-        end = self.end_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        start_jst = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        end_jst   = self.end_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        start_utc = jst_str_to_utc_sql(start_jst)
+        end_utc   = jst_str_to_utc_sql(end_jst)
         query = f"""
         SELECT DISTINCT u.first_name, u.last_name, u.id
         FROM passing p
         JOIN transponder_user tu ON p.transponder_id = tu.transponder_id
         JOIN user u ON tu.user_id = u.id
-        WHERE p.timestamp BETWEEN '{start}' AND '{end}'
+        WHERE p.timestamp BETWEEN '{start_utc}' AND '{end_utc}'
         AND p.timestamp BETWEEN tu.since AND tu.until
         ORDER BY u.last_name, u.first_name;
         """
@@ -109,8 +112,10 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Player Unselected", "Please select at least one player")
             return
 
-        start = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
-        end = self.end_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        start_jst = self.start_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        end_jst   = self.end_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        start_utc = jst_str_to_utc_sql(start_jst)
+        end_utc   = jst_str_to_utc_sql(end_jst)
         ids_str = ",".join(map(str, selected_ids))
 
         query = f"""
@@ -127,13 +132,13 @@ class MainWindow(QWidget):
             SELECT id, transponder_id, user_id
             FROM transponder_user
             WHERE user_id IN ({ids_str})
-            AND since <= '{start}'
-            AND (until IS NULL OR until > '{start}')
+            AND since <= '{start_utc}'
+            AND (until IS NULL OR until > '{start_utc}')
         ) tu
         ON tu.transponder_id = p.transponder_id
         JOIN `user` u ON u.id = tu.user_id
         WHERE 
-            p.timestamp BETWEEN '{start}' AND '{end}'
+            p.timestamp BETWEEN '{start_utc}' AND '{end_utc}'
             AND tu.user_id IN ({ids_str})
         ORDER BY 
             p.timestamp
