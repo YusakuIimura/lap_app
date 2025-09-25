@@ -201,7 +201,11 @@ class KPIPage(QWidget):
         self.rb_fly = QRadioButton("Flying")
         self.mode_group.addButton(self.rb_rs)
         self.mode_group.addButton(self.rb_fly)
-        self.rb_rs.setChecked(True)  # 既定はRS
+        initial_mode = (self._settings.get("ui", {}).get("time_mode") or "RS").upper()
+        self.time_mode = initial_mode
+        self.rb_rs.setChecked(initial_mode == "RS")
+        self.rb_fly.setChecked(initial_mode == "FLY")
+        
         row_top.addWidget(self.rb_rs)
         row_top.addWidget(self.rb_fly)
         layout.addLayout(row_top)
@@ -244,7 +248,6 @@ class KPIPage(QWidget):
         self.setLayout(layout)
 
         # 初期状態
-        self.time_mode = "RS"   # or "FLY"
         self._build_filters()   # モードに応じたフィルタ欄
         self._rebuild_table(self.debug_all_cols.isChecked())
 
