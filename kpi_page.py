@@ -182,6 +182,7 @@ class RangeFilterProxy(QSortFilterProxyModel):
 class KPIPage(QWidget):
     def __init__(self, query, stacked_widget):
         super().__init__()
+        self._base_query = query
         self.stacked_widget = stacked_widget
         self._settings = _load_json(SETTINGS_PATH)
 
@@ -209,7 +210,15 @@ class KPIPage(QWidget):
         
         row_top.addWidget(self.rb_rs)
         row_top.addWidget(self.rb_fly)
+        self.btnReload = QPushButton("最新情報に更新", self)
+        self.btnReload.clicked.connect(self._reload_kpi)
+        row_top.addWidget(self.btnReload)
         layout.addLayout(row_top)
+        
+        reload_action = QAction(self)
+        reload_action.setShortcut("Ctrl+R")
+        reload_action.triggered.connect(self._reload_kpi)
+        self.addAction(reload_action)
 
         # --- DB取得 ---
         df_any, _users = fetch_df_from_db(query, progress=lambda m: print(f"[KPI] {m}"))
@@ -319,6 +328,33 @@ class KPIPage(QWidget):
         tsv = "\n".join(lines)
         QGuiApplication.clipboard().setText(tsv)
         print(f"[KPI] {len(rows)} 行をクリップボードへコピーしました")
+
+    def _reload_kpi(self):
+        print("[KPI] リロード開始")
+        df_any, _users = fetch_df_from_db(self._base_query, progress=lambda m: print(f"[KPI] {m}"))
+
+        # ★ ここを self.df_all にする（UI は df_all を参照）
+        self.df_all = df_any.copy()
+
+        # __row_id を必要なら付与（_rebuild_table が期待）
+        if "__row_id" not in self.df_all.columns:
+            self.df_all["__row_id"] = range(len(self.df_all))
+
+        # （任意）現在のソート状態を保持→再適用
+        hh = self.table.horizontalHeader()
+        sort_col = hh.sortIndicatorSection()
+        sort_ord = hh.sortIndicatorOrder()
+
+        self._rebuild_table(self.debug_all_cols.isChecked())
+
+        # （任意）ソート復元
+        try:
+            self.table.sortByColumn(sort_col, sort_ord)
+        except Exception:
+            pass
+
+        print("[KPI] リロード完了")
+
 
 
     # ---- ヘルパ：現在のモードに対応する「標準表示KPI列」を返す（存在するものだけ）----

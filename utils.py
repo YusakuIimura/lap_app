@@ -490,6 +490,7 @@ def fetch_df_from_db(
             temp["first_name"] = group["first_name"].iloc[0]
         if "last_name" in group.columns:
             temp["last_name"]  = group["last_name"].iloc[0]
+        
 
         # 列整形（存在する imputed__* を末尾に）
         imputed_cols = [c for c in temp.columns if c.startswith("imputed__")]
