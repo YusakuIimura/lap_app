@@ -2,10 +2,11 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox,
-    QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup,QHeaderView
+    QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup,QHeaderView,
+    QMenu, QAction
 )
-from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel
-from PyQt5.QtGui import QDoubleValidator, QBrush, QColor
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QPoint
+from PyQt5.QtGui import QDoubleValidator, QBrush, QColor,QGuiApplication, QKeySequence
 import math
 import datetime
 import numpy as np
@@ -225,6 +226,17 @@ class KPIPage(QWidget):
 
         # --- テーブル ---
         self.table = QTableView()
+        # 右クリックメニュー
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+
+        # Ctrl/Cmd + C でコピー（お好みで）
+        copy_shortcut = QAction(self.table)
+        copy_shortcut.setShortcut(QKeySequence.Copy)
+        copy_shortcut.triggered.connect(self._copy_selected_rows_to_clipboard)
+        self.table.addAction(copy_shortcut)
+        
+        
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setAlternatingRowColors(True)
@@ -255,6 +267,59 @@ class KPIPage(QWidget):
         self.debug_all_cols.stateChanged.connect(lambda _s: self._rebuild_table(self.debug_all_cols.isChecked()))
         self.rb_rs.toggled.connect(lambda checked: checked and self._on_mode_changed("RS"))
         self.rb_fly.toggled.connect(lambda checked: checked and self._on_mode_changed("FLY"))
+
+    def _on_table_context_menu(self, pos: QPoint):
+        tv = self.table
+        idx = tv.indexAt(pos)
+        sel = tv.selectionModel()
+
+        # 右クリックした行を選択に含める（未選択や別行を右クリックしたとき）
+        if idx.isValid() and not sel.isSelected(idx):
+            tv.selectRow(idx.row())
+
+        menu = QMenu(tv)
+        act_copy = QAction("選択行をコピー（TSV）", menu)
+        act_copy.triggered.connect(self._copy_selected_rows_to_clipboard)
+        menu.addAction(act_copy)
+        menu.exec_(tv.viewport().mapToGlobal(pos))
+
+    def _copy_selected_rows_to_clipboard(self):
+        """現在のビュー（フィルタ＆ソート後）の選択行をTSVでコピー。
+        見出しは可視列のみ、値はDisplayRole（表示と同じ書式）。"""
+        tv = self.table
+        model = tv.model()                 # これは proxy（QSortFilterProxyModel）
+        sel = tv.selectionModel()
+        if not sel or not sel.hasSelection():
+            return
+
+        # 可視カラム（非表示は除外）とヘッダ
+        visible_cols = []
+        headers = []
+        for c in range(model.columnCount()):
+            if not tv.isColumnHidden(c):
+                visible_cols.append(c)
+                hdr = model.headerData(c, Qt.Horizontal)
+                headers.append("" if hdr is None else str(hdr))
+
+        # 選択された行番号（ビュー基準、昇順）
+        rows = sorted({i.row() for i in sel.selectedIndexes()})
+        if not rows:
+            rows = sorted(i.row() for i in sel.selectedRows())
+
+        # TSV組み立て（DisplayRoleで現在表示の文字列を取得）
+        lines = ["\t".join(headers)]
+        for r in rows:
+            vals = []
+            for c in visible_cols:
+                idx = model.index(r, c)
+                text = model.data(idx, Qt.DisplayRole)
+                vals.append("" if text is None else str(text))
+            lines.append("\t".join(vals))
+
+        tsv = "\n".join(lines)
+        QGuiApplication.clipboard().setText(tsv)
+        print(f"[KPI] {len(rows)} 行をクリップボードへコピーしました")
+
 
     # ---- ヘルパ：現在のモードに対応する「標準表示KPI列」を返す（存在するものだけ）----
     def _current_kpi_columns(self):

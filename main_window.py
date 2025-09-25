@@ -1,7 +1,7 @@
 # main_window.py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QDateEdit, QPushButton,
-    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit
+    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit,QAbstractItemView
 )
 from PyQt5.QtCore import QDateTime
 from kpi_page import KPIPage
@@ -69,10 +69,10 @@ class MainWindow(QWidget):
         self.layout.addWidget(self.search_btn)
 
         self.player_list = QListWidget()
-        self.player_list.setSelectionMode(QListWidget.MultiSelection)
+        self.player_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.layout.addWidget(self.player_list)
 
-        self.kpi_btn = QPushButton("Show KPIs")
+        self.kpi_btn = QPushButton("Show KPIs") 
         self.kpi_btn.clicked.connect(self.show_kpi)
         self.layout.addWidget(self.kpi_btn)
 
