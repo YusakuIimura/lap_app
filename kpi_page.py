@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 import json
 import os
-from utils import fetch_df_from_db
+from utils import fetch_df_from_db, translate_dict
+from utils import calculate_time_000_to_625_from_sb, calculate_time_000_to_125_from_sb, calculate_time_125_to_250
 
 # setting読み取り
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
@@ -39,8 +40,9 @@ NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
 # RS: 000→625, 625→125, 000→125
 # FLY: 000→100, 100→200, 000→200
 KPI_BY_MODE = {
-    "RS":  ["Time000to625", "Time625to125", "Time000to125"],
-    "FLY": ["Time000to100", "Time100to200", "Time000to200"],
+    "rolling":  ["Time000to625", "Time625to125", "Time000to125"],
+    "standing":  ["Time000to625", "Time625to125", "Time000to125"],
+    "flying": ["Time000to100", "Time100to200", "Time000to200"],
 }
 
 # フィルタUIに表示するラベル（見出し）
@@ -180,7 +182,8 @@ class RangeFilterProxy(QSortFilterProxyModel):
         return True
 
 class KPIPage(QWidget):
-    def __init__(self, query, stacked_widget):
+    def __init__(self, query, stacked_widget, user_ids):
+        self._user_ids = list(map(int, user_ids))
         super().__init__()
         self._base_query = query
         self.stacked_widget = stacked_widget
@@ -199,17 +202,34 @@ class KPIPage(QWidget):
         row_top.addWidget(self.debug_all_cols)
 
         self.mode_group = QButtonGroup(self)
-        self.rb_rs = QRadioButton("Rolling/Standing")
+        self.rb_roll = QRadioButton("Rolling")
+        self.rb_stand = QRadioButton("Standing")
         self.rb_fly = QRadioButton("Flying")
-        self.mode_group.addButton(self.rb_rs)
+        self.mode_group.addButton(self.rb_roll)
+        self.mode_group.addButton(self.rb_stand)
         self.mode_group.addButton(self.rb_fly)
-        initial_mode = (self._settings.get("ui", {}).get("time_mode") or "RS").upper()
+
+        ui_mode = (self._settings.get("ui", {}).get("time_mode") or "rolling")
+        u = ui_mode.upper()
+        if u in ("RS", "ROLLING"):
+            initial_mode = "rolling"
+        elif u in ("STANDING",):
+            initial_mode = "standing"
+        elif u in ("FLY", "FLYING"):
+            initial_mode = "flying"
+        else:
+            initial_mode = "rolling"
+
         self.time_mode = initial_mode
-        self.rb_rs.setChecked(initial_mode == "RS")
-        self.rb_fly.setChecked(initial_mode == "FLY")
+        self.rb_roll.setChecked(initial_mode == "rolling")
+        self.rb_stand.setChecked(initial_mode == "standing")
+        self.rb_fly.setChecked(initial_mode == "flying")
+
         
-        row_top.addWidget(self.rb_rs)
+        row_top.addWidget(self.rb_roll)
+        row_top.addWidget(self.rb_stand)
         row_top.addWidget(self.rb_fly)
+        
         self.btnReload = QPushButton("最新情報に更新", self)
         self.btnReload.clicked.connect(self._reload_kpi)
         row_top.addWidget(self.btnReload)
@@ -226,6 +246,38 @@ class KPIPage(QWidget):
         if "__row_id" not in df_any.columns:
             df_any["__row_id"] = range(len(df_any))
         self.df_all = df_any
+        
+        
+        # rolling：既存の列をそのまま使う（FP起点）
+        kpi_roll = {}
+        if "Time000to625" in self.df_all.columns:
+            kpi_roll["Time000to625"] = self.df_all["Time000to625"]
+        if "Time000to125" in self.df_all.columns:
+            kpi_roll["Time000to125"] = self.df_all["Time000to125"]
+        kpi_roll["Time125to250"] = self.df_all.apply(calculate_time_125_to_250, axis=1) 
+
+        # standing：同じ列名のまま “SB起点” で再計算（SBが空の行はNaNのまま）
+
+        kpi_st = {}
+        if {"SB1","AP1"}.issubset(self.df_all.columns):
+            kpi_st["Time000to625"] = self.df_all.apply(calculate_time_000_to_625_from_sb, axis=1)
+        if {"SB1","BP"}.issubset(self.df_all.columns):
+            kpi_st["Time000to125"] = self.df_all.apply(calculate_time_000_to_125_from_sb, axis=1)
+        kpi_st["Time125to250"] = self.df_all.apply(calculate_time_125_to_250, axis=1) 
+
+        # flying：既存のフライング用列をそのまま
+        kpi_fly = {}
+        for c in ["Time000to100","Time100to200","Time000to200"]:
+            if c in self.df_all.columns:
+                kpi_fly[c] = self.df_all[c]
+
+        # モード→（列名→Series）として保持
+        self._kpi_by_mode = {
+            "rolling": kpi_roll,
+            "standing": kpi_st,
+            "flying": kpi_fly,
+        }
+                
 
         # 数値フィルタフォーム（後で差し替え可能にする）
         self.filter_form = QFormLayout()
@@ -244,7 +296,6 @@ class KPIPage(QWidget):
         copy_shortcut.setShortcut(QKeySequence.Copy)
         copy_shortcut.triggered.connect(self._copy_selected_rows_to_clipboard)
         self.table.addAction(copy_shortcut)
-        
         
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(False)
@@ -274,8 +325,9 @@ class KPIPage(QWidget):
 
         # トグル/モードのイベント
         self.debug_all_cols.stateChanged.connect(lambda _s: self._rebuild_table(self.debug_all_cols.isChecked()))
-        self.rb_rs.toggled.connect(lambda checked: checked and self._on_mode_changed("RS"))
-        self.rb_fly.toggled.connect(lambda checked: checked and self._on_mode_changed("FLY"))
+        self.rb_roll.toggled.connect(lambda checked: checked and self._on_mode_changed("rolling"))
+        self.rb_stand.toggled.connect(lambda checked: checked and self._on_mode_changed("standing"))
+        self.rb_fly.toggled.connect(lambda checked: checked and self._on_mode_changed("flying"))
 
     def _on_table_context_menu(self, pos: QPoint):
         tv = self.table
@@ -333,21 +385,22 @@ class KPIPage(QWidget):
         print("[KPI] リロード開始")
         df_any, _users = fetch_df_from_db(self._base_query, progress=lambda m: print(f"[KPI] {m}"))
 
-        # ★ ここを self.df_all にする（UI は df_all を参照）
         self.df_all = df_any.copy()
 
         # __row_id を必要なら付与（_rebuild_table が期待）
         if "__row_id" not in self.df_all.columns:
             self.df_all["__row_id"] = range(len(self.df_all))
 
-        # （任意）現在のソート状態を保持→再適用
+        # self.df_all = self._filter_sb1_once_between_fp_0m(self.df_all, self._user_ids)
+
+        # 現在のソート状態を保持→再適用
         hh = self.table.horizontalHeader()
         sort_col = hh.sortIndicatorSection()
         sort_ord = hh.sortIndicatorOrder()
 
         self._rebuild_table(self.debug_all_cols.isChecked())
 
-        # （任意）ソート復元
+        # ソート復元
         try:
             self.table.sortByColumn(sort_col, sort_ord)
         except Exception:
@@ -357,7 +410,7 @@ class KPIPage(QWidget):
 
 
 
-    # ---- ヘルパ：現在のモードに対応する「標準表示KPI列」を返す（存在するものだけ）----
+    # ---- ヘルパ----
     def _current_kpi_columns(self):
         """
         KPIフィルタ対象の列を、モード(self.time_mode)に応じて最小集合に絞る。
@@ -381,21 +434,69 @@ class KPIPage(QWidget):
         return cols_in_df
 
     def _display_kpi_columns(self):
-        # 表示用（3列）: モード別の標準KPI
-        mode = (getattr(self, "time_mode", "RS") or "RS").upper()
-        if mode == "RS":
-            allowed = ["Time000to625", "Time625to125", "Time000to125"]
-        else:  # FLY
+        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
+        if mode in ("rolling", "standing"):
+            allowed = ["Time000to125", "Time125to250"]
+        else:  # flying
             allowed = ["Time000to100", "Time100to200", "Time000to200"]
-        return [c for c in allowed if c in self.df_all.columns]
 
+        # ★ df_all だけで存在判定しない。モード側で作る列も可にする
+        present = set(self.df_all.columns) | set((getattr(self, "_kpi_by_mode", {}) or {}).get(mode, {}).keys())
+        return [c for c in allowed if c in present]
+    
     def _filter_kpi_columns(self):
-        # フィルタUI用（1列）
-        mode = (getattr(self, "time_mode", "RS") or "RS").upper()
-        if mode == "RS":
-            return ["Time000to125"]
-        else:  # FLY
+        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
+        if mode in ("rolling", "standing"):
+            return ["Time000to125"]    # 当面はRSの代表列で1本
+        else:  # flying
             return ["Time000to200"]
+
+    def _filter_sb1_once_between_fp_0m(self, df: pd.DataFrame, user_ids):
+        """
+        SB1は「(各 user_id の文脈で) 直前FP〜最初の0m の“間”に ちょうど1回だけ 出た」ものだけ残す。
+        FP/0m/その他の地点はそのまま残す。
+        """
+        if df.empty or "position" not in df.columns or "timestamp" not in df.columns:
+            return df
+
+        gdf = df.sort_values("timestamp").reset_index(drop=True).copy()
+
+        # 最終的に残す SB1 を集約（複数選手に対して OR で結合）
+        sb1_keep_any = pd.Series(False, index=gdf.index)
+
+        for uid in user_ids:
+            is_fp  = (gdf["position"] == "FP")  & (gdf["user_id"] == uid)
+            is_0m  = (gdf["position"] == "0m")  & (gdf["user_id"] == uid)
+            is_sb1 = (gdf["position"] == "SB1")
+
+            # 区間ID（この選手のFPのみでカウント）
+            fp_cum = is_fp.cumsum()
+            z0_cum = is_0m.cumsum()
+
+            # この選手の文脈で「直前FPがあり、まだ0mが来ていない」区間
+            between = fp_cum.gt(z0_cum)
+
+            # “最初の0m”が存在する区間のみ有効
+            has_0m_by_interval = (
+                is_0m.groupby(fp_cum).transform("max").astype(bool)
+            )
+
+            # FP〜最初の0m の“間”の SB1
+            sb1_between = is_sb1 & between & has_0m_by_interval
+
+            # 各区間の SB1 件数
+            sb1_cnt = sb1_between.groupby(fp_cum).transform("sum")
+
+            # その区間で SB1 がちょうど1件のときだけ、その SB1 を残す
+            sb1_keep_uid = sb1_between & (sb1_cnt == 1)
+
+            # 複数選手分を統合（どれかの選手文脈で条件を満たせば採用）
+            sb1_keep_any |= sb1_keep_uid
+
+        # 非SB1は常に残す。SB1は keep_any のみ残す
+        mask_keep = (gdf["position"] != "SB1") | sb1_keep_any
+        return gdf[mask_keep].reset_index(drop=True)
+
 
     # ---- フィルタUIをビルド（モードごとに作り直し）----
     def _build_filters(self):
@@ -455,23 +556,54 @@ class KPIPage(QWidget):
             self.table.setModel(self.proxy)
             return
 
+        # 1) 表示用DFを作成（元dfは変更しない）
         if "__row_id" not in self.df_all.columns:
             self.df_all = self.df_all.copy()
             self.df_all["__row_id"] = range(len(self.df_all))
 
+        df_current = self.df_all.copy()
+
+        # ★ 2) KPIだけモードの結果で上書き（事前に self._kpi_by_mode を用意しておく）
+        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
+        for col, series in (getattr(self, "_kpi_by_mode", {}) or {}).get(mode, {}).items():
+            try:
+                df_current[col] = series
+            except Exception:
+                # 長さ不一致などで失敗しても安全にスキップ
+                pass
+
+        # 3) 表示列の決定
         if show_all:
-            cols = [c for c in self.df_all.columns if not (c.startswith("imputed__") or c == "__row_id")]
+            # 1) 表示対象（imputed/__row_id 除外）
+            all_cols = [c for c in df_current.columns
+                        if not (c.startswith("imputed__") or c == "__row_id")]
+
+            # 2) 優先配置リスト = 名前列 + モード既定KPI（存在チェックは _display_kpi_columns 内で済む）
+            priority = []
+            priority += [c for c in NAME_COLUMNS if c in all_cols]
+            priority += self._display_kpi_columns()  # ← rolling/standing/flying の“既定KPI”順
+
+            # 3) 残りは元の順のまま後ろへ
+            extras = [c for c in all_cols if c not in priority]
+
+            # 4) 重複除去して順序維持
+            seen = set()
+            cols = []
+            for c in priority + extras:
+                if c not in seen:
+                    cols.append(c)
+                    seen.add(c)
         else:
-            # 名称列 + モード別KPI列（存在するものだけ）
+            # （非 show_all の分岐はそのまま）
             cols = NAME_COLUMNS + self._display_kpi_columns()
-            cols = [c for c in cols if c in self.df_all.columns and not (c.startswith("imputed__") or c == "__row_id")]
+            cols = [c for c in cols if c in df_current.columns and not (c.startswith("imputed__") or c == "__row_id")]
             if not cols:
-                # 何も無ければ全列にフォールバック
-                cols = [c for c in self.df_all.columns if not (c.startswith("imputed__") or c == "__row_id")]
+                cols = [c for c in df_current.columns if not (c.startswith("imputed__") or c == "__row_id")]
 
-        df_view = self.df_all[cols].copy()
 
-        # 赤字用マスク
+        df_view = df_current[cols].copy()
+
+        # 4) 赤字用マスク（imputed__* は元dfのフラグを参照）
         mask_view = None
         flag_map = {c: f"imputed__{c}" for c in cols}
         if any(fc in self.df_all.columns for fc in flag_map.values()):
@@ -480,39 +612,32 @@ class KPIPage(QWidget):
                 if fc in self.df_all.columns:
                     mask_view[c] = self.df_all[fc].astype(bool).reindex(df_view.index).values
 
-        # モデル/プロキシ
+        # 5) モデル/プロキシ
         self.model = DataFrameModel(df_view, mask_view)
         self.proxy = RangeFilterProxy(df_view.columns.tolist())
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
-        
-        # 列ヘッダを手動調整可能に
+
+        # 6) 見た目調整
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(QHeaderView.Interactive)
 
-        # 全列の基準幅（ここを好みで 140〜160 に）
         default_width = 160
         wider = {
             "first_name": 160,
             "last_name": 160,
-            # "Time000to200": 150,
-            # "Time000to125": 150,
         }
-        
-        visible_cols = list(self.model._df.columns)  # DataFrameModel 内部DFの列
+        visible_cols = list(self.model._df.columns)
         for i, c in enumerate(visible_cols):
             self.table.setColumnWidth(i, wider.get(c, default_width))
-
-        # 行の高さも少し余裕を（任意）
         self.table.verticalHeader().setDefaultSectionSize(26)
 
-        # 現在のフィルタ入力をプロキシへ反映（モードで列が変わった時のため）
-        # ※ visible_columns は df_view.columns。フィルタは self.min_edits の列だけ設定
+        # 7) 既存フィルタ値を反映
         for c, me in self.min_edits.items():
             xe = self.max_edits[c]
             self.proxy.setRange(c, me.text(), xe.text())
 
-        # 複数行選択
+        # 8) 複数行選択
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 

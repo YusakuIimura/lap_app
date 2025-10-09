@@ -53,9 +53,6 @@ class MainWindow(QWidget):
 
         self.layout = QVBoxLayout()
 
-
-        # self.start_datetime.setDateTime(QDateTime.fromString("2025-06-29 00:00:00", "yyyy-MM-dd HH:mm:ss"))
-        # self.end_datetime.setDateTime(QDateTime.fromString("2025-06-30 23:59:59", "yyyy-MM-dd HH:mm:ss"))
         self.start_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self.end_datetime.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         
@@ -124,35 +121,40 @@ class MainWindow(QWidget):
         end_utc   = jst_str_to_utc_sql(end_jst)
         ids_str = ",".join(map(str, selected_ids))
 
-        query = f"""
-        SELECT 
+        query=f"""
+        SELECT
             p.timestamp,
             p.decoder_id,
             u.first_name,
             u.last_name,
             p.transponder_id,
-            tu.user_id
-        FROM 
-            passing p
-        JOIN (
-            SELECT id, transponder_id, user_id
+            tu.user_id,
+            tu.id AS transponder_user_id
+        FROM passing p
+        LEFT JOIN (
+            SELECT id, transponder_id, user_id, since, until
             FROM transponder_user
             WHERE user_id IN ({ids_str})
-            AND since <= '{start_utc}'
-            AND (until IS NULL OR until > '{start_utc}')
         ) tu
         ON tu.transponder_id = p.transponder_id
-        JOIN `user` u ON u.id = tu.user_id
-        WHERE 
-            p.timestamp BETWEEN '{start_utc}' AND '{end_utc}'
-            AND tu.user_id IN ({ids_str})
-        ORDER BY 
-            p.timestamp
+        AND tu.since <= p.timestamp
+        AND (tu.until IS NULL OR tu.until > p.timestamp)
+        LEFT JOIN `user` u
+        ON u.id = tu.user_id
+        WHERE p.timestamp >= '{start_utc}'
+        AND p.timestamp <  '{end_utc}'
+        AND (
+                tu.user_id IS NOT NULL              -- ユーザーにひもづく transponder の通過
+                OR p.transponder_id IS NULL         -- transponder_id が NULL
+                OR p.transponder_id = ''            -- transponder_id が空文字
+            )
+        ORDER BY p.timestamp
         LIMIT 10000;
+
         """
 
         # ページ遷移
-        kpi_page = KPIPage(query, self.stacked_widget)
+        kpi_page = KPIPage(query, self.stacked_widget, selected_ids)
         self.stacked_widget.addWidget(kpi_page)
         self.stacked_widget.setCurrentWidget(kpi_page)
 

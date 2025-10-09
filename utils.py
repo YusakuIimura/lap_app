@@ -57,10 +57,8 @@ def _load_json(path):
 def _get_db_url_from_settings():
     s = _load_json(SETTINGS_PATH)
     db = s.get("db", {})
-    # 直接URL指定があればそれを使う（例: "mysql+pymysql://user:pass@host/db?charset=utf8mb4"）
     if "url" in db and db["url"]:
         return db["url"]
-    # 個別指定（driver/host/port/name/user/pass）から組み立て
     driver = db.get("driver", "mysql+pymysql")
     host   = db.get("host", "127.0.0.1")
     port   = int(db.get("port", 3306))
@@ -93,7 +91,6 @@ def to_jst_naive(series: pd.Series) -> pd.Series:
     s = pd.to_datetime(series, errors="coerce", utc=True)
     s = s.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
     return s
-
 
 def _build_distance_map():
     """SEGMENTSから列順と累積距離[m]を算出"""
@@ -173,6 +170,9 @@ def get_df_from_db(query):
         df = pd.read_sql(query, conn)
     return df
 
+
+import unicodedata, re
+
 def split_laps(df):
     """
     Robust lap splitter:
@@ -185,18 +185,34 @@ def split_laps(df):
       - _2nd列は確定後にシフトで一括:
           FP_2nd = 次行の FP_first
           0m_2nd = 次行の 0m_start
+      - SB1: FP_start～0m_start の間に存在すればその時刻を1回だけ記録（補間なし）
     """
+    def _canon_pos(x: str) -> str:
+        if x is None:
+            return ""
+        s = unicodedata.normalize("NFKC", str(x)).strip()
+        u = s.upper()
+        if u in {"FP", "ＦＰ"}:
+            return "FP"
+        if u in {"0M", "OM", "0Ｍ"}:
+            return "0m"
+        # SB1 バリアント（SB-1, SB 1, ＳＢ１ など）
+        if re.fullmatch(r"SB[\s\-]*1", u) or u == "ＳＢ１":
+            return "SB1"
+        return s  # 既知以外はそのまま（NFKC+trim 済み）
+
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-    anchors = {"FP", "0m"}
+    # 正規化した position 列を用意（以降はこれだけ使う）
+    df["position"] = df["position"].map(_canon_pos)
+
+    anchors   = {"FP", "0m"}
     inner_pts = ["60m", "AP1", "50m", "100m", "BP", "150m", "AP2", "200m"]
 
-    # 中間生成用の列（FP_firstは内部用）
-    tmp_cols = ["FP_first", "0m_start"] + inner_pts
+    tmp_cols = ["FP_first", "SB1", "0m_start"] + inner_pts
     rows = []
-
     cur = {k: None for k in tmp_cols}
     anchor = None  # 現在のラップのアンカー: 'FP' or '0m' or None
 
@@ -205,18 +221,18 @@ def split_laps(df):
         if any(v is not None for v in cur.values()):
             rows.append(cur)
         cur = {k: None for k in tmp_cols}
-        # 次のラップ開始時に再設定する
         anchor = None
 
     for _, r in df.iterrows():
         pos = r["position"]
         ts  = r["timestamp"]
 
-        if pos not in anchors and pos not in inner_pts:
+        # 想定外の地点は無視（SB1 は許可）
+        if (pos not in anchors) and (pos not in inner_pts) and (pos != "SB1"):
             continue
 
+        # --- アンカー処理（FP / 0m）---
         if pos in anchors:
-            # アンカー処理
             if anchor is None:
                 # 新規ラップ開始
                 anchor = pos
@@ -236,14 +252,24 @@ def split_laps(df):
                     else:  # pos == "0m"
                         cur["0m_start"] = ts
                 else:
-                    # 異なるアンカーがラップ途中で現れた → 値だけ記録して継続
+                    # 異なるアンカーが途中で出た → 値だけ記録し継続
                     if pos == "FP" and cur["FP_first"] is None:
                         cur["FP_first"] = ts
                     if pos == "0m" and cur["0m_start"] is None:
                         cur["0m_start"] = ts
             continue
 
-        # 内側ポイント：最初の観測だけ記録
+        # --- SB1（FP～0mの間に1回だけ）---
+        if pos == "SB1":
+            fp_seen     = (cur.get("FP_first") is not None) and (not pd.isna(cur.get("FP_first")))
+            z0_not_seen = (cur.get("0m_start") is None) or pd.isna(cur.get("0m_start"))
+            sb1_not_set = (cur.get("SB1") is None) or pd.isna(cur.get("SB1"))
+            if (anchor is not None) and fp_seen and z0_not_seen and sb1_not_set:
+                cur["SB1"] = ts
+                print(f"[DBG split] SB1 recorded at {ts}")
+            continue
+
+        # --- 内側ポイント（60m, AP1, ...）：最初の観測だけ記録 ---
         if anchor is not None and pos in inner_pts and cur[pos] is None:
             cur[pos] = ts
 
@@ -251,9 +277,7 @@ def split_laps(df):
     flush()
 
     if not rows:
-        return pd.DataFrame(columns=[
-            "FP_start", "0m_start", *inner_pts, "FP_2nd", "0m_2nd"
-        ])
+        return pd.DataFrame(columns=["FP_start", "SB1", "0m_start", *inner_pts, "FP_2nd", "0m_2nd"])
 
     out_tmp = pd.DataFrame(rows, columns=tmp_cols)
 
@@ -265,26 +289,36 @@ def split_laps(df):
             return pd.NaT
         if pd.isna(z0):
             return fp
-        return fp if fp <= z0 else pd.NaT  # 0mより後に来たFPは使わない
+        return fp if fp <= z0 else pd.NaT
 
     out = pd.DataFrame()
     out["FP_start"] = out_tmp.apply(compute_fp_start, axis=1)
+    out["SB1"]      = out_tmp["SB1"]                      # 補間なし（実測のみ）
     out["0m_start"] = out_tmp["0m_start"]
     for c in inner_pts:
         out[c] = out_tmp[c]
 
     # _2nd は「次行の start」をシフトで付与
-    out["FP_2nd"] = out_tmp["FP_first"].shift(-1)   # 表示用で欠測にしたFPでも、次FPの実観測時刻は保持
+    out["FP_2nd"] = out_tmp["FP_first"].shift(-1)   # 次ラップの最初のFP（生値）
     out["0m_2nd"] = out["0m_start"].shift(-1)
-    
+
     # 年月日列（ラップ内で最初に観測できた時刻の日付）
-    cols_for_date = ["FP_first", "0m_start"] + inner_pts  # inner_pts = ["60m","AP1","50m","100m","BP","150m","AP2","200m"]
+    cols_for_date = ["FP_first", "0m_start"] + inner_pts
     first_ts = out_tmp[cols_for_date].apply(
         lambda r: r.dropna().min() if r.notna().any() else pd.NaT, axis=1
     )
-    out.insert(0, "Date", pd.to_datetime(first_ts).dt.date)  # 先頭列に挿入
+    out.insert(0, "Date", pd.to_datetime(first_ts).dt.date)
+
+    try:
+        if "SB1" in out.columns:
+            print(f"[DBG][split_laps] SB1_nonnull: {int(out['SB1'].notna().sum())}")
+        else:
+            print("[DBG][split_laps] SB1 column missing in output")
+    except Exception as e:
+        print(f"[DBG][split_laps] SB1 check failed: {e}")
 
     return out
+
 
 def calculate_entry_speed(row):
     # l = 17.97  # 0m-FP間距離（m）
@@ -315,7 +349,7 @@ def calculate_time_000_to_100(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
 
 def calculate_time_100_to_200(row):
     t1, t2 = row.get("0m_2nd"), row.get("150m")
@@ -324,7 +358,7 @@ def calculate_time_100_to_200(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
 
 def calculate_time_000_to_200(row):
     t1, t2 = row.get("0m_2nd"), row.get("50m")
@@ -333,7 +367,7 @@ def calculate_time_000_to_200(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
 
 def calculate_time_000_to_625(row):
     t1, t2 = row.get("AP1"), row.get("FP_start")
@@ -342,7 +376,7 @@ def calculate_time_000_to_625(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
 
 def calculate_time_625_to_125(row):
     t1, t2 = row.get("BP"), row.get("AP1")
@@ -351,7 +385,7 @@ def calculate_time_625_to_125(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
 
 def calculate_time_000_to_125(row):
     t1, t2 = row.get("BP"), row.get("FP_start")
@@ -360,7 +394,35 @@ def calculate_time_000_to_125(row):
     td = t1 - t2
     if pd.isna(td) or td.total_seconds() == 0:
         return np.nan
-    return round(td.total_seconds(), 2)
+    return round(td.total_seconds(), 3)
+
+def calculate_time_125_to_250(row):
+    """BP → FP_2nd の秒数。どちらか欠けていたら NaN。0以下は NaN。"""
+    t0, t1 = row.get("BP"), row.get("FP_2nd")
+    if pd.isna(t0) or pd.isna(t1):
+        return np.nan
+    dt = t1 - t0
+    return round(dt.total_seconds(), 3) if pd.notna(dt) and dt.total_seconds() > 0 else np.nan
+
+def calculate_time_000_to_625_from_sb(row):
+    """standing 用：SB1→AP1 の秒数（SB1が無ければ NaN、補完しない）"""
+    t0, t1 = row.get("SB1"), row.get("AP1")
+    if pd.isna(t0) or pd.isna(t1):
+        return np.nan
+    td = t1 - t0
+    if pd.isna(td) or td.total_seconds() <= 0:
+        return np.nan
+    return round(td.total_seconds(), 3)
+
+def calculate_time_000_to_125_from_sb(row):
+    """standing 用：SB1→BP の秒数（SB1が無ければ NaN、補完しない）"""
+    t0, t1 = row.get("SB1"), row.get("BP")
+    if pd.isna(t0) or pd.isna(t1):
+        return np.nan
+    td = t1 - t0
+    if pd.isna(td) or td.total_seconds() <= 0:
+        return np.nan
+    return round(td.total_seconds(), 3)
 
 
 # utils.py 内：KPI計算の直後あたりに追加
@@ -402,11 +464,11 @@ def fetch_df_from_db(
     """
     DESIRED_ORDER = [
         "first_name", "last_name", "Date",
-        "entry_speed", "jump_speed",
         "Time000to100", "Time100to200", "Time000to200",
-        "Time000to625", "Time625to125", "Time000to125",
-        "FP_start", "0m_start", "60m", "AP1", "50m", "100m",
-        "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd"
+        "Time000to625", "Time625to125", "Time000to125", "Time125to250",
+        "FP_start","SB1", "0m_start", "60m", "AP1", "50m", "100m",
+        "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd",
+        "entry_speed", "jump_speed",
     ]
 
     def _p(msg: str):
@@ -449,6 +511,13 @@ def fetch_df_from_db(
     else:
         df["position"] = "Unknown"
     _check_cancel()
+    
+    # ★ 追加: 位置ラベルの内訳を確認
+    try:
+        cnt = df["position"].value_counts(dropna=False).to_dict()
+        print(f"[DBG] position counts (before per-user filter): {cnt}")
+    except Exception as e:
+        print(f"[DBG] position counts failed: {e}")
 
     # 4) ユーザーごと処理
     _p("ユーザーごとに集計中…")
@@ -460,9 +529,82 @@ def fetch_df_from_db(
         _check_cancel()
         _p(f"ユーザー {uid if uid is not None else '-'}: split中…")
         group = group.sort_values(by=["timestamp"]).reset_index(drop=True)
+        
+        # ▼ 追加: 全体の SB1 行を取り込み（user_id が空でもOK）
+        sb1_all = df[df["position"] == "SB1"].copy()
+        # タイムレンジで軽く絞る（任意）：このユーザーのデータ期間±余白に限定
+        if not group.empty:
+            tmin, tmax = group["timestamp"].min(), group["timestamp"].max()
+            sb1_all = sb1_all[(sb1_all["timestamp"] >= tmin) & (sb1_all["timestamp"] <= tmax)]
+            
+        # このユーザーの FP/0m は user_id==uid の行のみで定義
+        is_fp_user = group["position"].eq("FP")
+        is_0m_user = group["position"].eq("0m")
 
+        # 区間ID（このユーザーのFPのみでカウント）
+        fp_cum_user = is_fp_user.cumsum()
+        z0_cum_user = is_0m_user.cumsum()
+
+        # このユーザーの文脈で「直前FPがあり、まだ0mが来ていない」区間（ユーザー行のみ）
+        between_user = fp_cum_user.gt(z0_cum_user)
+
+        # ── ここから SB1 判定：SB1 は “全体から” 拾う ──
+        # 各 FP 区間の「最初の 0m 時刻」をユーザー行から求めて map
+        interval_id_user = fp_cum_user
+        first0_ts_by_int = (
+            group.assign(_is0m=is_0m_user)
+                .groupby(interval_id_user, dropna=False)
+                .apply(lambda s: s.loc[s["_is0m"], "timestamp"].iloc[0] if s["_is0m"].any() else pd.NaT)
+        )
+
+        # SB1 にも「どのユーザー区間に属するか」を割り当てる必要があるため、
+        # SB1 をユーザー行と縦結合して “同一の時系列” 上で区間IDを引く。
+        work = pd.concat([group, sb1_all], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+
+        # ユーザーの FP/0m のみで区間IDを進める（非ユーザー行は0のまま進行しないので forward-fill）
+        is_fp_in_work = (work["position"].eq("FP")) & (work.get("user_id") == uid)
+        is_0m_in_work = (work["position"].eq("0m")) & (work.get("user_id") == uid)
+
+        fp_cum_work = is_fp_in_work.cumsum()
+        z0_cum_work = is_0m_in_work.cumsum()
+
+        # FP〜0m の “間” の判定を work 上で作る（ユーザー文脈）
+        between_work = fp_cum_work.gt(z0_cum_work)
+
+        # 各行の区間ID
+        interval_id_work = fp_cum_work
+
+        # 各行に「この区間の最初の0m時刻」を付与（ユーザー行から作ったテーブルを map）
+        work["_first0"] = interval_id_work.map(first0_ts_by_int)
+
+        # 条件を満たす SB1（SB1 ∧ ユーザー文脈で間にある ∧ 最初の0mより前）
+        sb1_between = (work["position"].eq("SB1")) & between_work & work["timestamp"].lt(work["_first0"])
+
+        # さらに “ちょうど1回だけ” 条件：区間ごとに SB1 件数を数えて1のものだけ
+        sb1_cnt = sb1_between.groupby(interval_id_work, dropna=False).transform("sum")
+        sb1_keep = sb1_between & sb1_cnt.eq(1)
+
+        # このユーザーの最終入力：元のユーザー行 + 残すべき SB1 行
+        # （ユーザー行は常に残す。SB1は keep のものだけ残す。他の非ユーザー行は捨てる）
+        keep_mask = (work.get("user_id") == uid) | sb1_keep
+        group_plus_sb1 = work[keep_mask].copy().sort_values("timestamp").reset_index(drop=True)
+
+        # ▼ デバッグ（任意）
+        try:
+            pre = int((group["position"] == "SB1").sum())
+            aft = int((group_plus_sb1["position"] == "SB1").sum())
+            print(f"[DBG][uid={uid}] SB1 before={pre}, after-merge={aft}")
+        except Exception:
+            pass
+
+    
         # --- split ---
-        temp = split_laps(group)
+        temp = split_laps(group_plus_sb1)
+        
+        # ★ 追加: split後、SB1列があるか＆非NaT件数
+        cols = list(temp.columns)
+        sb1_nonnull = int(temp["SB1"].notna().sum()) if "SB1" in temp.columns else "N/A"
+        print(f"[DBG][uid={uid}] split cols: {cols} | SB1_nonnull: {sb1_nonnull}")
 
         # --- 補間 ---
         _p(f"ユーザー {uid if uid is not None else '-'}: 補間中…")
@@ -511,7 +653,11 @@ def fetch_df_from_db(
         return pd.DataFrame(columns=empty_cols), users
 
     _p("結合中…")
+    print(f"[DBG] concat about to merge {len(all_dfs)} dfs")
     result_df = pd.concat(all_dfs, ignore_index=True)
+    print(f"[DBG] result columns: {result_df.columns.tolist()}")
+    if "SB1" in result_df.columns:
+        print(f"[DBG] result SB1_nonnull: {int(result_df['SB1'].notna().sum())}")
 
     _p("完了")
     return result_df, users
