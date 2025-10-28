@@ -465,7 +465,7 @@ def fetch_df_from_db(
     DESIRED_ORDER = [
         "first_name", "last_name", "Date",
         "Time000to100", "Time100to200", "Time000to200",
-        "Time000to625", "Time625to125", "Time000to125", "Time125to250",
+        "Time000to625","Time625to125",  "Time000to125_roll", "Time000to125_stand", "Time125to250",
         "FP_start","SB1", "0m_start", "60m", "AP1", "50m", "100m",
         "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd",
         "entry_speed", "jump_speed",
@@ -624,7 +624,9 @@ def fetch_df_from_db(
         temp["Time000to200"]  = temp.apply(calculate_time_000_to_200, axis=1)
         temp["Time000to625"]  = temp.apply(calculate_time_000_to_625, axis=1)
         temp["Time625to125"]  = temp.apply(calculate_time_625_to_125, axis=1)
-        temp["Time000to125"]  = temp.apply(calculate_time_000_to_125, axis=1)
+        temp["Time000to125_roll"]  = temp.apply(calculate_time_000_to_125, axis=1)
+        temp["Time000to125_stand"] = temp.apply(calculate_time_000_to_125_from_sb, axis=1)
+        temp["Time125to250"] = temp.apply(calculate_time_125_to_250, axis=1)
 
         # --- 補間フラグ伝搬 & 氏名付与 ---
         temp = _propagate_imputed_flags_to_kpi(temp)

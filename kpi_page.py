@@ -14,7 +14,7 @@ import pandas as pd
 import json
 import os
 from utils import fetch_df_from_db, translate_dict
-from utils import calculate_time_000_to_625_from_sb, calculate_time_000_to_125_from_sb, calculate_time_125_to_250
+from utils import calculate_time_000_to_625_from_sb,calculate_time_125_to_250
 
 # setting読み取り
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
@@ -40,8 +40,8 @@ NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
 # RS: 000→625, 625→125, 000→125
 # FLY: 000→100, 100→200, 000→200
 KPI_BY_MODE = {
-    "rolling":  ["Time000to625", "Time625to125", "Time000to125"],
-    "standing":  ["Time000to625", "Time625to125", "Time000to125"],
+    "rolling":  ["Time000to625", "Time625to125", "Time000to125_roll"],
+    "standing":  ["Time000to625", "Time625to125", "Time000to125_stand"],
     "flying": ["Time000to100", "Time100to200", "Time000to200"],
 }
 
@@ -49,7 +49,8 @@ KPI_BY_MODE = {
 FILTER_LABELS = {
     "Time000to625": "Time 000→625",
     "Time625to125": "Time 625→125",
-    "Time000to125": "Time 000→125",
+    "Time000to125_roll":  "Time 000→125",
+    "Time000to125_stand": "Time 000→125",
     "Time000to100": "Time 000→100",
     "Time100to200": "Time 100→200",
     "Time000to200": "Time 000→200",
@@ -248,22 +249,27 @@ class KPIPage(QWidget):
         self.df_all = df_any
         
         
-        # rolling：既存の列をそのまま使う（FP起点）
+        # rolling 側（抜粋）
         kpi_roll = {}
         if "Time000to625" in self.df_all.columns:
             kpi_roll["Time000to625"] = self.df_all["Time000to625"]
-        if "Time000to125" in self.df_all.columns:
-            kpi_roll["Time000to125"] = self.df_all["Time000to125"]
-        kpi_roll["Time125to250"] = self.df_all.apply(calculate_time_125_to_250, axis=1) 
+        if "Time625to125" in self.df_all.columns:
+            kpi_roll["Time625to125"] = self.df_all["Time625to125"]
+        if "Time000to125_roll" in self.df_all.columns:
+            kpi_roll["Time000to125_roll"] = self.df_all["Time000to125_roll"]
+        kpi_roll["Time125to250"] = self.df_all["Time125to250"] if "Time125to250" in self.df_all.columns else self.df_all.apply(calculate_time_125_to_250, axis=1)
 
-        # standing：同じ列名のまま “SB起点” で再計算（SBが空の行はNaNのまま）
-
+        # standing 側（抜粋）
         kpi_st = {}
         if {"SB1","AP1"}.issubset(self.df_all.columns):
+            # 625はSB起点の専用関数でも可（従来どおり）
             kpi_st["Time000to625"] = self.df_all.apply(calculate_time_000_to_625_from_sb, axis=1)
-        if {"SB1","BP"}.issubset(self.df_all.columns):
-            kpi_st["Time000to125"] = self.df_all.apply(calculate_time_000_to_125_from_sb, axis=1)
-        kpi_st["Time125to250"] = self.df_all.apply(calculate_time_125_to_250, axis=1) 
+        if "Time625to125" in self.df_all.columns:
+            kpi_st["Time625to125"] = self.df_all["Time625to125"]
+        if "Time000to125_stand" in self.df_all.columns:
+            kpi_st["Time000to125_stand"] = self.df_all["Time000to125_stand"]
+        kpi_st["Time125to250"] = self.df_all["Time125to250"] if "Time125to250" in self.df_all.columns else self.df_all.apply(calculate_time_125_to_250, axis=1)
+
 
         # flying：既存のフライング用列をそのまま
         kpi_fly = {}
@@ -435,19 +441,24 @@ class KPIPage(QWidget):
 
     def _display_kpi_columns(self):
         mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
-        if mode in ("rolling", "standing"):
-            allowed = ["Time000to125", "Time125to250"]
+        if mode == "rolling":
+            allowed = ["Time000to125_roll", "Time125to250"]
+        elif mode == "standing":
+            allowed = ["Time000to125_stand", "Time125to250"]
         else:  # flying
             allowed = ["Time000to100", "Time100to200", "Time000to200"]
 
-        # ★ df_all だけで存在判定しない。モード側で作る列も可にする
         present = set(self.df_all.columns) | set((getattr(self, "_kpi_by_mode", {}) or {}).get(mode, {}).keys())
         return [c for c in allowed if c in present]
+
     
     def _filter_kpi_columns(self):
         mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
-        if mode in ("rolling", "standing"):
-            return ["Time000to125"]    # 当面はRSの代表列で1本
+        if mode == "rolling":
+            # 新列優先、なければ旧列にフォールバック
+            return [c for c in ["Time000to125_roll", "Time000to125"] if c in self.df_all.columns] or ["Time000to125_roll"]
+        elif mode == "standing":
+            return [c for c in ["Time000to125_stand", "Time000to125"] if c in self.df_all.columns] or ["Time000to125_stand"]
         else:  # flying
             return ["Time000to200"]
 
