@@ -457,24 +457,18 @@ def fetch_df_from_db(
     cancel_event: Optional[threading.Event] = None,
 ):
     """
-    DB→前処理→split→補間→KPI→結合 を行う。
+    DB→前処理→split→補間→結合 を行う。
     - progress(msg): 進捗メッセージをUIへ通知（未指定なら無視）
     - cancel_event: .set() されていたら安全に中断（未指定なら無視）
     戻り値: (result_df, users)
     """
-    DESIRED_ORDER = [
-        "first_name", "last_name", "Date",
-        "Time000to100", "Time100to200", "Time000to200",
-        "Time000to625","Time625to125",  "Time000to125_roll", "Time000to125_stand", "Time125to250",
-        "FP_start","SB1", "0m_start", "60m", "AP1", "50m", "100m",
-        "BP", "150m", "AP2", "200m", "FP_2nd", "0m_2nd",
-        "entry_speed", "jump_speed",
-    ]
 
     def _p(msg: str):
         if progress:
-            try: progress(msg)
-            except Exception: pass
+            try:
+                progress(msg)
+            except Exception:
+                pass
 
     def _check_cancel():
         if cancel_event is not None and cancel_event.is_set():
@@ -489,14 +483,8 @@ def fetch_df_from_db(
     users = df["first_name"].unique() if "first_name" in df.columns else []
     if df.empty:
         _p("データ0件")
-        # 期待カラムの空DF（補間フラグ込み）を返す
-        imputed_bases = [
-            "FP_start","0m_start","60m","AP1","50m","100m",
-            "BP","150m","AP2","200m","FP_2nd","0m_2nd",
-            "entry_speed","jump_speed","Time000to100","Time100to200","Time000to200"
-        ]
-        empty_cols = DESIRED_ORDER + [f"imputed__{c}" for c in imputed_bases]
-        return pd.DataFrame(columns=empty_cols), users
+        # スキーマだけ維持した空DFを返す
+        return df.copy(), users
 
     # 2) タイムスタンプをJST（naive）へ
     _p("タイムスタンプ変換中…")
@@ -512,7 +500,7 @@ def fetch_df_from_db(
         df["position"] = "Unknown"
     _check_cancel()
     
-    # ★ 追加: 位置ラベルの内訳を確認
+    # デバッグ: 位置ラベルの内訳
     try:
         cnt = df["position"].value_counts(dropna=False).to_dict()
         print(f"[DBG] position counts (before per-user filter): {cnt}")
@@ -528,15 +516,18 @@ def fetch_df_from_db(
     for uid, group in groups:
         _check_cancel()
         _p(f"ユーザー {uid if uid is not None else '-'}: split中…")
+
         group = group.sort_values(by=["timestamp"]).reset_index(drop=True)
-        
-        # ▼ 追加: 全体の SB1 行を取り込み（user_id が空でもOK）
+
+        # ▼ 全体の SB1 行を取り込み（user_id 無しでもOK）
         sb1_all = df[df["position"] == "SB1"].copy()
-        # タイムレンジで軽く絞る（任意）：このユーザーのデータ期間±余白に限定
+        # このユーザーのデータ期間内に絞る
         if not group.empty:
             tmin, tmax = group["timestamp"].min(), group["timestamp"].max()
-            sb1_all = sb1_all[(sb1_all["timestamp"] >= tmin) & (sb1_all["timestamp"] <= tmax)]
-            
+            sb1_all = sb1_all[
+                (sb1_all["timestamp"] >= tmin) & (sb1_all["timestamp"] <= tmax)
+            ]
+
         # このユーザーの FP/0m は user_id==uid の行のみで定義
         is_fp_user = group["position"].eq("FP")
         is_0m_user = group["position"].eq("0m")
@@ -545,51 +536,57 @@ def fetch_df_from_db(
         fp_cum_user = is_fp_user.cumsum()
         z0_cum_user = is_0m_user.cumsum()
 
-        # このユーザーの文脈で「直前FPがあり、まだ0mが来ていない」区間（ユーザー行のみ）
-        between_user = fp_cum_user.gt(z0_cum_user)
-
-        # ── ここから SB1 判定：SB1 は “全体から” 拾う ──
         # 各 FP 区間の「最初の 0m 時刻」をユーザー行から求めて map
         interval_id_user = fp_cum_user
         first0_ts_by_int = (
             group.assign(_is0m=is_0m_user)
-                .groupby(interval_id_user, dropna=False)
-                .apply(lambda s: s.loc[s["_is0m"], "timestamp"].iloc[0] if s["_is0m"].any() else pd.NaT)
+            .groupby(interval_id_user, dropna=False)
+            .apply(
+                lambda s: s.loc[s["_is0m"], "timestamp"].iloc[0]
+                if s["_is0m"].any()
+                else pd.NaT
+            )
         )
 
-        # SB1 にも「どのユーザー区間に属するか」を割り当てる必要があるため、
-        # SB1 をユーザー行と縦結合して “同一の時系列” 上で区間IDを引く。
-        work = pd.concat([group, sb1_all], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+        # SB1 を含めた時系列上で区間IDを引く
+        work = pd.concat([group, sb1_all], ignore_index=True).sort_values(
+            "timestamp"
+        ).reset_index(drop=True)
 
-        # ユーザーの FP/0m のみで区間IDを進める（非ユーザー行は0のまま進行しないので forward-fill）
+        # ユーザーの FP/0m のみで区間IDを進める
         is_fp_in_work = (work["position"].eq("FP")) & (work.get("user_id") == uid)
         is_0m_in_work = (work["position"].eq("0m")) & (work.get("user_id") == uid)
 
         fp_cum_work = is_fp_in_work.cumsum()
         z0_cum_work = is_0m_in_work.cumsum()
 
-        # FP〜0m の “間” の判定を work 上で作る（ユーザー文脈）
+        # FP〜0m の “間” の判定を work 上で作る
         between_work = fp_cum_work.gt(z0_cum_work)
 
         # 各行の区間ID
         interval_id_work = fp_cum_work
 
-        # 各行に「この区間の最初の0m時刻」を付与（ユーザー行から作ったテーブルを map）
+        # 各行に「この区間の最初の0m時刻」を付与
         work["_first0"] = interval_id_work.map(first0_ts_by_int)
 
-        # 条件を満たす SB1（SB1 ∧ ユーザー文脈で間にある ∧ 最初の0mより前）
-        sb1_between = (work["position"].eq("SB1")) & between_work & work["timestamp"].lt(work["_first0"])
+        # 条件を満たす SB1（SB1 ∧ 間にある ∧ 最初の0mより前）
+        sb1_between = (
+            work["position"].eq("SB1")
+            & between_work
+            & work["timestamp"].lt(work["_first0"])
+        )
 
-        # さらに “ちょうど1回だけ” 条件：区間ごとに SB1 件数を数えて1のものだけ
+        # 区間ごとに SB1 件数を数えて 1 のものだけ残す
         sb1_cnt = sb1_between.groupby(interval_id_work, dropna=False).transform("sum")
         sb1_keep = sb1_between & sb1_cnt.eq(1)
 
         # このユーザーの最終入力：元のユーザー行 + 残すべき SB1 行
-        # （ユーザー行は常に残す。SB1は keep のものだけ残す。他の非ユーザー行は捨てる）
         keep_mask = (work.get("user_id") == uid) | sb1_keep
-        group_plus_sb1 = work[keep_mask].copy().sort_values("timestamp").reset_index(drop=True)
+        group_plus_sb1 = (
+            work[keep_mask].copy().sort_values("timestamp").reset_index(drop=True)
+        )
 
-        # ▼ デバッグ（任意）
+        # デバッグ
         try:
             pre = int((group["position"] == "SB1").sum())
             aft = int((group_plus_sb1["position"] == "SB1").sum())
@@ -597,14 +594,17 @@ def fetch_df_from_db(
         except Exception:
             pass
 
-    
         # --- split ---
         temp = split_laps(group_plus_sb1)
-        
-        # ★ 追加: split後、SB1列があるか＆非NaT件数
+
+        # デバッグ: split後のSB1
         cols = list(temp.columns)
-        sb1_nonnull = int(temp["SB1"].notna().sum()) if "SB1" in temp.columns else "N/A"
-        print(f"[DBG][uid={uid}] split cols: {cols} | SB1_nonnull: {sb1_nonnull}")
+        sb1_nonnull = (
+            int(temp["SB1"].notna().sum()) if "SB1" in temp.columns else "N/A"
+        )
+        print(
+            f"[DBG][uid={uid}] split cols: {cols} | SB1_nonnull: {sb1_nonnull}"
+        )
 
         # --- 補間 ---
         _p(f"ユーザー {uid if uid is not None else '-'}: 補間中…")
@@ -613,46 +613,26 @@ def fetch_df_from_db(
 
         # --- 2nd 再計算 ---
         temp["0m_2nd"] = temp["0m_start"].shift(-1)
-        temp["FP_2nd"] = temp["FP_first"].shift(-1) if "FP_first" in temp.columns else temp["FP_start"].shift(-1)
+        temp["FP_2nd"] = (
+            temp["FP_first"].shift(-1)
+            if "FP_first" in temp.columns
+            else temp["FP_start"].shift(-1)
+        )
 
-        # --- KPI計算 ---
-        _p(f"ユーザー {uid if uid is not None else '-'}: KPI計算中…")
-        temp["entry_speed"]   = temp.apply(calculate_entry_speed, axis=1)
-        temp["jump_speed"]    = temp.apply(calculate_jump_speed, axis=1)
-        temp["Time000to100"]  = temp.apply(calculate_time_000_to_100, axis=1)
-        temp["Time100to200"]  = temp.apply(calculate_time_100_to_200, axis=1)
-        temp["Time000to200"]  = temp.apply(calculate_time_000_to_200, axis=1)
-        temp["Time000to625"]  = temp.apply(calculate_time_000_to_625, axis=1)
-        temp["Time625to125"]  = temp.apply(calculate_time_625_to_125, axis=1)
-        temp["Time000to125_roll"]  = temp.apply(calculate_time_000_to_125, axis=1)
-        temp["Time000to125_stand"] = temp.apply(calculate_time_000_to_125_from_sb, axis=1)
-        temp["Time125to250"] = temp.apply(calculate_time_125_to_250, axis=1)
-
-        # --- 補間フラグ伝搬 & 氏名付与 ---
-        temp = _propagate_imputed_flags_to_kpi(temp)
+        # --- 氏名付与 ---
         if "first_name" in group.columns:
             temp["first_name"] = group["first_name"].iloc[0]
         if "last_name" in group.columns:
-            temp["last_name"]  = group["last_name"].iloc[0]
-        
+            temp["last_name"] = group["last_name"].iloc[0]
 
-        # 列整形（存在する imputed__* を末尾に）
-        imputed_cols = [c for c in temp.columns if c.startswith("imputed__")]
-        ordered_cols = [c for c in DESIRED_ORDER if c in temp.columns] + [c for c in imputed_cols if c not in DESIRED_ORDER]
-        temp = temp.reindex(columns=ordered_cols)
-
-        all_dfs.append(temp)
+        # 列整形はここでは行わず、そのまま使う
+        all_dfs.append(temp.copy())
 
     # 5) 結合（空安全）
     if not all_dfs:
         _p("集計結果0件")
-        imputed_bases = [
-            "FP_start","0m_start","60m","AP1","50m","100m",
-            "BP","150m","AP2","200m","FP_2nd","0m_2nd",
-            "entry_speed","jump_speed","Time000to100","Time100to200","Time000to200"
-        ]
-        empty_cols = DESIRED_ORDER + [f"imputed__{c}" for c in imputed_bases]
-        return pd.DataFrame(columns=empty_cols), users
+        # 元DFのスキーマだけ持った空DF
+        return df.iloc[0:0].copy(), users
 
     _p("結合中…")
     print(f"[DBG] concat about to merge {len(all_dfs)} dfs")

@@ -1,0 +1,20 @@
+{
+  "rolling": [
+    {
+      "start": "50m",
+      "end": "100m"
+    },
+    {
+      "start": "100m",
+      "end": "50m",
+      "name": "100→次周50"
+    }
+  ],
+  "standing": [
+    {
+      "start": "SB1",
+      "end": "BP"
+    }
+  ],
+  "flying": []
+}

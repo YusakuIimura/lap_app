@@ -1,64 +1,85 @@
-# kpi_page.py (fixed full)
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox,
-    QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup,QHeaderView,
-    QMenu, QAction
+    QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup, QHeaderView,
+    QMenu, QAction, QComboBox,QTableWidget, QTableWidgetItem
 )
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QPoint
-from PyQt5.QtGui import QDoubleValidator, QBrush, QColor,QGuiApplication, QKeySequence
+from PyQt5.QtGui import QBrush, QColor, QGuiApplication, QKeySequence, QPixmap
+
 import math
 import datetime
 import numpy as np
 import pandas as pd
 import json
 import os
-from utils import fetch_df_from_db, translate_dict
-from utils import calculate_time_000_to_625_from_sb,calculate_time_125_to_250
 
-# setting読み取り
+from utils import fetch_df_from_db
+
+# --------------------------------------------------------------------------------------
+# 共通定数 / ヘルパ
+# --------------------------------------------------------------------------------------
+
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
+KPI_INTERVALS_PATH = os.path.join(os.getcwd(), "kpi.json")
+TRACK_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "track-ref.jpg")
 
-def _load_json(path):
+TRACK_ORDER = [
+    "FP_start",
+    "SB1",
+    "0m_start",
+    "60m",
+    "AP1",
+    "50m",
+    "100m",
+    "BP",
+    "150m",
+    "AP2",
+    "200m",
+    "FP_2nd",
+    "0m_2nd",
+]
+# 名前系は常に先頭に出したい列
+NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
+
+
+def _load_json(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
-    
-def _save_json(path, obj):
+
+def _save_json(path: str, obj: dict):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+def _load_kpi_intervals(path: str) -> dict:
+    """kpi.json から interval 定義を読み込む（壊れていたら空 dict）"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
 
 
-# ---- 固定の名前列 ----
-NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
+# --------------------------------------------------------------------------------------
+# DataFrame -> Qt Model
+# --------------------------------------------------------------------------------------
 
-# ---- モード別・標準表示KPI列（存在しない列は自動スキップ）----
-# RS: 000→625, 625→125, 000→125
-# FLY: 000→100, 100→200, 000→200
-KPI_BY_MODE = {
-    "rolling":  ["Time000to625", "Time625to125", "Time000to125_roll"],
-    "standing":  ["Time000to625", "Time625to125", "Time000to125_stand"],
-    "flying": ["Time000to100", "Time100to200", "Time000to200"],
-}
-
-# フィルタUIに表示するラベル（見出し）
-FILTER_LABELS = {
-    "Time000to625": "Time 000→625",
-    "Time625to125": "Time 625→125",
-    "Time000to125_roll":  "Time 000→125",
-    "Time000to125_stand": "Time 000→125",
-    "Time000to100": "Time 000→100",
-    "Time100to200": "Time 100→200",
-    "Time000to200": "Time 000→200",
-}
-
-# ---- DataFrame -> Qt Model ----
 class DataFrameModel(QAbstractTableModel):
-    def __init__(self, df: pd.DataFrame, mask: pd.DataFrame = None):
+    """
+    単純な DataFrame 表示モデル。
+    - Timestamp: HH:MM:SS(.mmm)
+    - Timedelta: MM:SS.mmm
+    - それ以外: str(val)
+    """
+
+    def __init__(self, df: pd.DataFrame, mask: pd.DataFrame | None = None):
         super().__init__()
         self._df = df.reset_index(drop=True)
         self._mask = mask
@@ -79,24 +100,14 @@ class DataFrameModel(QAbstractTableModel):
             if pd.isna(val):
                 return ""
 
-            # 時刻だけ表示
-            if isinstance(val, pd.Timestamp):
+            # Timestamp 系
+            if isinstance(val, (pd.Timestamp, datetime.datetime)):
                 ms = val.microsecond // 1000
-                return val.strftime("%H:%M:%S") if ms == 0 else val.strftime("%H:%M:%S.%f")[:-3]
+                fmt = "%H:%M:%S" if ms == 0 else "%H:%M:%S.%f"
+                text = val.strftime(fmt)
+                return text if ms == 0 else text[:-3]
 
-            if isinstance(val, datetime.datetime):
-                ms = val.microsecond // 1000
-                return val.strftime("%H:%M:%S") if ms == 0 else val.strftime("%H:%M:%S.%f")[:-3]
-
-            if isinstance(val, np.datetime64):
-                ts = pd.to_datetime(val)
-                if pd.isna(ts):
-                    return ""
-                # pandasのTimestampに変換して同様に表示
-                ts = pd.Timestamp(ts)
-                ms = ts.microsecond // 1000
-                return ts.strftime("%H:%M:%S") if ms == 0 else ts.strftime("%H:%M:%S.%f")[:-3]
-
+            # Timedelta 系
             if isinstance(val, pd.Timedelta):
                 total_ms = int(val / pd.Timedelta(milliseconds=1))
                 sign = "-" if total_ms < 0 else ""
@@ -127,80 +138,449 @@ class DataFrameModel(QAbstractTableModel):
             return self._df.columns[section]
         return str(section + 1)
 
-# ---- 数値レンジ（min/max）で列ごとフィルタ ----
+
 class RangeFilterProxy(QSortFilterProxyModel):
     """
-    可視テーブル（source model）の列順 = visible_columns。
-    フィルタ対象列 = self.ranges のキー（列名）。
+    単一KPIに対する数値レンジフィルタ。
+    - visible_columns: 表示されている列名の順序
+    - filter_col: 絞り込み対象列名（None ならフィルタ無し）
+    - vmin, vmax: 数値レンジ（両方 None ならフィルタ無し）
     """
-    def __init__(self, visible_columns):
-        super().__init__()
-        self.visible_columns = list(visible_columns)  # ソースモデルの列順
-        self.ranges = {}  # name -> (min,max)
 
-    def set_visible_columns(self, visible_columns):
+    def __init__(self, visible_columns: list[str]):
+        super().__init__()
+        self.visible_columns = list(visible_columns)
+        self.filter_col: str | None = None
+        self.vmin: float | None = None
+        self.vmax: float | None = None
+
+    def set_visible_columns(self, visible_columns: list[str]):
         self.visible_columns = list(visible_columns)
         self.invalidateFilter()
 
-    def setRange(self, col_name: str, vmin: str, vmax: str):
-        def to_float_or_none(s):
-            if s is None:
-                return None
-            s = str(s).strip()
-            if s == "":
-                return None
-            try:
-                return float(s)
-            except Exception:
-                return None
-        self.ranges[col_name] = (to_float_or_none(vmin), to_float_or_none(vmax))
+    def set_filter_column(self, col_name: str | None):
+        self.filter_col = col_name
+        self.invalidateFilter()
+
+    def set_range(self, vmin: float | None, vmax: float | None):
+        self.vmin = vmin
+        self.vmax = vmax
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
-        # 数値列のAND条件
-        for col_name, (vmin, vmax) in self.ranges.items():
-            if col_name not in self.visible_columns:
-                # 今の表示テーブルにこの列が無ければ無視
-                continue
-            try:
-                col_idx = self.visible_columns.index(col_name)
-            except ValueError:
-                continue
-            idx = model.index(source_row, col_idx)
-            text = model.data(idx, Qt.DisplayRole)
-            try:
-                val = float(text) if text not in (None, "") else math.nan
-            except Exception:
-                val = math.nan
 
-            if vmin is not None:
-                if math.isnan(val) or val < vmin:
-                    return False
-            if vmax is not None:
-                if math.isnan(val) or val > vmax:
-                    return False
+        # フィルタ列が指定されていない／レンジが無い場合は全通し
+        if not self.filter_col or (self.vmin is None and self.vmax is None):
+            return True
+
+        try:
+            col_idx = self.visible_columns.index(self.filter_col)
+        except ValueError:
+            return True  # 表示されていなければフィルタしない
+
+        idx = model.index(source_row, col_idx)
+        text = model.data(idx, Qt.DisplayRole)
+        if text in (None, ""):
+            return False
+
+        try:
+            val = float(text)
+        except Exception:
+            return False
+
+        if self.vmin is not None and val < self.vmin:
+            return False
+        if self.vmax is not None and val > self.vmax:
+            return False
+
         return True
 
-class KPIPage(QWidget):
-    def __init__(self, query, stacked_widget, user_ids):
-        self._user_ids = list(map(int, user_ids))
+
+class KPIJsonEditorPage(QWidget):
+    """
+    kpi.json をGUIで編集するページ。
+
+    上: トラック図の画像
+    下: モード(rolling/standing/flying)ごとの start/end 区間の一覧と追加・削除UI
+    """
+
+    def __init__(self, kpi_page: "KPIPage"):
         super().__init__()
+        self.kpi_page = kpi_page
+        self.stacked_widget = kpi_page.stacked_widget
+
+        # 元の設定をコピーして編集用に保持
+        import copy
+        self._config = copy.deepcopy(kpi_page._interval_config) or {}
+        for key in ("rolling", "standing", "flying"):
+            self._config.setdefault(key, [])
+
+        # start/end で選べる地点（df_all にある列だけを採用）
+        self.available_points = [
+            p for p in TRACK_ORDER if p in kpi_page.df_all.columns
+        ]
+
+        self._build_ui()
+        self._refresh_mode_entries()
+
+    # ------------------------------------------------------------------
+    # UI 構築
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        self.setWindowTitle("KPI設定の編集")
+        main = QVBoxLayout()
+
+        # 画像エリア
+        img_label = QLabel()
+        if os.path.exists(TRACK_IMAGE_PATH):
+            pix = QPixmap(TRACK_IMAGE_PATH)
+            if not pix.isNull():
+                # 幅に合わせて縮小（高さは自動）
+                pix = pix.scaledToWidth(900, Qt.SmoothTransformation)
+                img_label.setPixmap(pix)
+                img_label.setAlignment(Qt.AlignCenter)
+            else:
+                img_label.setText(f"画像を読み込めません: {TRACK_IMAGE_PATH}")
+        else:
+            img_label.setText(f"トラック画像が見つかりません: {TRACK_IMAGE_PATH}")
+        main.addWidget(img_label)
+
+        # モード選択
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("モード:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Rolling", userData="rolling")
+        self.mode_combo.addItem("Standing", userData="standing")
+        self.mode_combo.addItem("Flying", userData="flying")
+        self.mode_combo.currentIndexChanged.connect(self._refresh_mode_entries)
+        mode_row.addWidget(self.mode_combo)
+        mode_row.addStretch()
+        main.addLayout(mode_row)
+
+        # 現在の定義一覧テーブル
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["表示名", "start", "end"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        main.addWidget(self.table)
+
+        # 追加用UI
+        add_row = QHBoxLayout()
+        self.start_combo = QComboBox()
+        self.start_combo.addItems(self.available_points)
+        self.end_combo = QComboBox()
+        self.end_combo.addItems(self.available_points)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("表示名（空なら start-end）")
+
+        add_row.addWidget(QLabel("start:"))
+        add_row.addWidget(self.start_combo)
+        add_row.addWidget(QLabel("end:"))
+        add_row.addWidget(self.end_combo)
+        add_row.addWidget(QLabel("表示名:"))
+        add_row.addWidget(self.name_edit)
+
+        self.btnAdd = QPushButton("追加")
+        self.btnAdd.clicked.connect(self._on_add_clicked)
+        add_row.addWidget(self.btnAdd)
+
+        main.addLayout(add_row)
+
+        # 操作用ボタン
+        btn_row = QHBoxLayout()
+        self.btnDelete = QPushButton("選択行を削除")
+        self.btnDelete.clicked.connect(self._on_delete_clicked)
+        btn_row.addWidget(self.btnDelete)
+
+        btn_row.addStretch()
+
+        self.btnCancel = QPushButton("キャンセル")
+        self.btnCancel.clicked.connect(self._on_cancel_clicked)
+        btn_row.addWidget(self.btnCancel)
+
+        self.btnSave = QPushButton("保存して戻る")
+        self.btnSave.clicked.connect(self._on_save_clicked)
+        btn_row.addWidget(self.btnSave)
+
+        main.addLayout(btn_row)
+
+        self.setLayout(main)
+
+    # ------------------------------------------------------------------
+    # モードごとの一覧表示
+    # ------------------------------------------------------------------
+    def _current_mode(self) -> str:
+        data = self.mode_combo.currentData()
+        return data or "rolling"
+
+    def _refresh_mode_entries(self):
+        mode = self._current_mode()
+        entries = self._config.get(mode, [])
+
+        self.table.setRowCount(0)
+        for ent in entries:
+            start = ent.get("start", "")
+            end = ent.get("end", "")
+            name = ent.get("name") or f"{start}-{end}"
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(str(name)))
+            self.table.setItem(row, 1, QTableWidgetItem(str(start)))
+            self.table.setItem(row, 2, QTableWidgetItem(str(end)))
+
+    # ------------------------------------------------------------------
+    # 追加 / 削除 / 保存 / 戻る
+    # ------------------------------------------------------------------
+    def _on_add_clicked(self):
+        mode = self._current_mode()
+        start = self.start_combo.currentText()
+        end = self.end_combo.currentText()
+        name = self.name_edit.text().strip()
+
+        if not start or not end:
+            QMessageBox.warning(self, "追加できません", "start と end を選択してください。")
+            return
+
+        entry = {"start": start, "end": end}
+        if name:
+            entry["name"] = name
+
+        self._config.setdefault(mode, []).append(entry)
+        self.name_edit.clear()
+        self._refresh_mode_entries()
+
+    def _on_delete_clicked(self):
+        mode = self._current_mode()
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            return
+
+        rows = sorted(r.row() for r in sel)
+        rows.reverse()  # 下から消す
+        entries = self._config.get(mode, [])
+        for r in rows:
+            if 0 <= r < len(entries):
+                entries.pop(r)
+        self._refresh_mode_entries()
+
+    def _on_cancel_clicked(self):
+        # 何も保存せずに元の画面へ戻る
+        sw = self.stacked_widget
+        sw.setCurrentWidget(self.kpi_page)
+        sw.removeWidget(self)
+        self.deleteLater()
+
+    def _on_save_clicked(self):
+        # JSONファイルに保存
+        try:
+            _save_json(KPI_INTERVALS_PATH, self._config)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失敗", f"kpi.json の保存に失敗しました:\n{e}")
+            return
+
+        # 親ページに反映してテーブル更新
+        self.kpi_page._interval_config = self._config
+        self.kpi_page._ensure_interval_columns()
+        self.kpi_page._build_filters()
+        self.kpi_page._rebuild_table(self.kpi_page.debug_all_cols.isChecked())
+
+        QMessageBox.information(self, "保存完了", "kpi.json を保存しました。")
+
+        sw = self.stacked_widget
+        sw.setCurrentWidget(self.kpi_page)
+        sw.removeWidget(self)
+        self.deleteLater()
+
+
+# --------------------------------------------------------------------------------------
+# KPI Page 本体
+# --------------------------------------------------------------------------------------
+
+class KPIPage(QWidget):
+    """
+    KPIページ
+    - データ処理ロジック（DB 取得 / KPI 計算）は _load_data_and_prepare_kpi 系に集約
+    - UI 構築は _build_ui / _build_filters / _rebuild_table で担当
+    """
+
+    # ------------------------------------------------------------------
+    # 初期化
+    # ------------------------------------------------------------------
+    def __init__(self, query: str, stacked_widget, user_ids):
+        super().__init__()
+
         self._base_query = query
         self.stacked_widget = stacked_widget
-        self._settings = _load_json(SETTINGS_PATH)
+        self._user_ids = list(map(int, user_ids))
 
+        self._settings = _load_json(SETTINGS_PATH)
+        self._interval_config: dict = {}
+
+        # フィルタ用
+        self.filter_kpi_combo: QComboBox | None = None
+        self.filter_min_edit: QLineEdit | None = None
+        self.filter_max_edit: QLineEdit | None = None
+        self._filter_stats: dict[str, tuple[float | None, float | None]] = {}
+        self._current_filter_col: str | None = None
+
+        # time_mode 初期値
+        ui_mode = (self._settings.get("ui", {}).get("time_mode") or "rolling").lower()
+        if ui_mode in ("rs", "rolling"):
+            self.time_mode = "rolling"
+        elif ui_mode in ("standing",):
+            self.time_mode = "standing"
+        elif ui_mode in ("fly", "flying"):
+            self.time_mode = "flying"
+        else:
+            self.time_mode = "rolling"
+
+        # データ読み込み + KPI 準備（Data ロジック）
+        self.df_all = pd.DataFrame()
+        self._load_data_and_prepare_kpi()
+
+        # UI 構築（UI ロジック）
+        self._build_ui()
+
+        # フィルタ・テーブル初期化
+        self._build_filters()
+        self._rebuild_table(self.debug_all_cols.isChecked())
+
+    # ------------------------------------------------------------------
+    # データロジック
+    # ------------------------------------------------------------------
+    def _load_data_and_prepare_kpi(self):
+        """DB から df_all を取得し、区間列とモード別 KPI を構築する。"""
+        df_any, _users = fetch_df_from_db(self._base_query, progress=lambda m: print(f"[KPI] {m}"))
+        df_any = df_any.copy()
+
+        if "__row_id" not in df_any.columns:
+            df_any["__row_id"] = range(len(df_any))
+
+        self.df_all = df_any
+
+        # kpi.json から interval 定義を読み込み
+        self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
+
+        # ラップタイム列から区間タイム列を追加
+        self._ensure_interval_columns()
+
+    def _ensure_interval_columns(self):
+        """
+        kpi.json の start/end 定義に基づき、区間タイム列を self.df_all に追加する。
+
+        - name があれば列名に使用
+        - name がなければ "start-end" を列名にする
+        - TRACK_ORDER 上で start が end より後ろの場合は
+          「start(この周回) → end(次周)」として計算する
+        """
+        if self.df_all.empty:
+            return
+
+        cfg = self._interval_config or {}
+        pos_index = {name: i for i, name in enumerate(TRACK_ORDER)}
+
+        for mode, entries in cfg.items():
+            if not isinstance(entries, list):
+                continue
+
+            for ent in entries:
+                start = ent.get("start")
+                end = ent.get("end")
+                if not start or not end:
+                    continue
+
+                col_name = ent.get("name") or f"{start}-{end}"
+
+                # すでに列があるなら再計算しない
+                if col_name in self.df_all.columns:
+                    continue
+
+                # 必要な地点タイムが無ければスキップ
+                if start not in self.df_all.columns or end not in self.df_all.columns:
+                    continue
+
+                s = self.df_all[start]
+                e = self.df_all[end]
+
+                # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
+                idx_s = pos_index.get(start)
+                idx_e = pos_index.get(end)
+
+                if idx_s is not None and idx_e is not None and idx_s > idx_e:
+                    # start の方が“後” → end は次周の値を使う
+                    e_series = e.shift(-1)
+                else:
+                    # 通常: 同一周回内
+                    e_series = e
+
+                diff = e_series - s
+
+                # datetime → Timedelta → 秒
+                try:
+                    self.df_all[col_name] = diff.dt.total_seconds().round(3)
+                except Exception:
+                    # 念のためのフォールバック
+                    def _calc(row):
+                        t0 = row.get(start)
+                        t1 = row.get(end)
+                        if idx_s is not None and idx_e is not None and idx_s > idx_e:
+                            # 次周の end
+                            # row 単位では next row を取れないので NaN 扱い
+                            return math.nan
+                        if pd.isna(t0) or pd.isna(t1):
+                            return math.nan
+                        try:
+                            return float((t1 - t0).total_seconds())
+                        except Exception:
+                            return math.nan
+
+                    self.df_all[col_name] = self.df_all.apply(_calc, axis=1)
+
+
+    def _display_kpi_columns(self) -> list[str]:
+        """
+        現在のモード(self.time_mode)について、
+        kpi.json の start/end 定義から生成される KPI 列名を返す。
+
+        - name があれば name
+        - なければ "start-end"
+        """
+        mode = (self.time_mode or "rolling").lower()
+        cfg = self._interval_config or {}
+        entries = cfg.get(mode, [])
+
+        cols: list[str] = []
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            start = ent.get("start")
+            end = ent.get("end")
+            if not start or not end:
+                continue
+            name = ent.get("name") or f"{start}-{end}"
+            cols.append(name)
+
+        # 実際に DataFrame に存在するものだけ
+        return [c for c in cols if c in self.df_all.columns]
+
+    # ------------------------------------------------------------------
+    # UIロジック
+    # ------------------------------------------------------------------
+    def _build_ui(self):
         self.setWindowTitle("Display KPIs")
         self.resize(980, 640)
 
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel("KPIs"))
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(QLabel("KPIs"))
 
-        # --- トグル & モード切替 ---
-        row_top = QHBoxLayout()
+        # --- 上部バー（Show All, モード切替, Reload） ---
+        top_row = QHBoxLayout()
+
         self.debug_all_cols = QCheckBox("Show All Columns")
         self.debug_all_cols.setChecked(False)
-        row_top.addWidget(self.debug_all_cols)
+        top_row.addWidget(self.debug_all_cols)
 
         self.mode_group = QButtonGroup(self)
         self.rb_roll = QRadioButton("Rolling")
@@ -210,137 +590,372 @@ class KPIPage(QWidget):
         self.mode_group.addButton(self.rb_stand)
         self.mode_group.addButton(self.rb_fly)
 
-        ui_mode = (self._settings.get("ui", {}).get("time_mode") or "rolling")
-        u = ui_mode.upper()
-        if u in ("RS", "ROLLING"):
-            initial_mode = "rolling"
-        elif u in ("STANDING",):
-            initial_mode = "standing"
-        elif u in ("FLY", "FLYING"):
-            initial_mode = "flying"
-        else:
-            initial_mode = "rolling"
+        self.rb_roll.setChecked(self.time_mode == "rolling")
+        self.rb_stand.setChecked(self.time_mode == "standing")
+        self.rb_fly.setChecked(self.time_mode == "flying")
 
-        self.time_mode = initial_mode
-        self.rb_roll.setChecked(initial_mode == "rolling")
-        self.rb_stand.setChecked(initial_mode == "standing")
-        self.rb_fly.setChecked(initial_mode == "flying")
+        top_row.addWidget(self.rb_roll)
+        top_row.addWidget(self.rb_stand)
+        top_row.addWidget(self.rb_fly)
 
-        
-        row_top.addWidget(self.rb_roll)
-        row_top.addWidget(self.rb_stand)
-        row_top.addWidget(self.rb_fly)
-        
         self.btnReload = QPushButton("最新情報に更新", self)
         self.btnReload.clicked.connect(self._reload_kpi)
-        row_top.addWidget(self.btnReload)
-        layout.addLayout(row_top)
+        top_row.addWidget(self.btnReload)
         
+        self.btnEditKpiJson = QPushButton("KPI設定を編集", self)
+        self.btnEditKpiJson.clicked.connect(self._open_kpi_json_editor)
+        top_row.addWidget(self.btnEditKpiJson)
+
+        # ショートカット: Ctrl+R でリロード
         reload_action = QAction(self)
         reload_action.setShortcut("Ctrl+R")
         reload_action.triggered.connect(self._reload_kpi)
         self.addAction(reload_action)
 
-        # --- DB取得 ---
-        df_any, _users = fetch_df_from_db(query, progress=lambda m: print(f"[KPI] {m}"))
-        df_any = df_any.copy()
-        if "__row_id" not in df_any.columns:
-            df_any["__row_id"] = range(len(df_any))
-        self.df_all = df_any
-        
-        
-        # rolling 側（抜粋）
-        kpi_roll = {}
-        if "Time000to625" in self.df_all.columns:
-            kpi_roll["Time000to625"] = self.df_all["Time000to625"]
-        if "Time625to125" in self.df_all.columns:
-            kpi_roll["Time625to125"] = self.df_all["Time625to125"]
-        if "Time000to125_roll" in self.df_all.columns:
-            kpi_roll["Time000to125_roll"] = self.df_all["Time000to125_roll"]
-        kpi_roll["Time125to250"] = self.df_all["Time125to250"] if "Time125to250" in self.df_all.columns else self.df_all.apply(calculate_time_125_to_250, axis=1)
+        main_layout.addLayout(top_row)
 
-        # standing 側（抜粋）
-        kpi_st = {}
-        if {"SB1","AP1"}.issubset(self.df_all.columns):
-            # 625はSB起点の専用関数でも可（従来どおり）
-            kpi_st["Time000to625"] = self.df_all.apply(calculate_time_000_to_625_from_sb, axis=1)
-        if "Time625to125" in self.df_all.columns:
-            kpi_st["Time625to125"] = self.df_all["Time625to125"]
-        if "Time000to125_stand" in self.df_all.columns:
-            kpi_st["Time000to125_stand"] = self.df_all["Time000to125_stand"]
-        kpi_st["Time125to250"] = self.df_all["Time125to250"] if "Time125to250" in self.df_all.columns else self.df_all.apply(calculate_time_125_to_250, axis=1)
-
-
-        # flying：既存のフライング用列をそのまま
-        kpi_fly = {}
-        for c in ["Time000to100","Time100to200","Time000to200"]:
-            if c in self.df_all.columns:
-                kpi_fly[c] = self.df_all[c]
-
-        # モード→（列名→Series）として保持
-        self._kpi_by_mode = {
-            "rolling": kpi_roll,
-            "standing": kpi_st,
-            "flying": kpi_fly,
-        }
-                
-
-        # 数値フィルタフォーム（後で差し替え可能にする）
+        # --- フィルタフォーム（1行だけ：KPI選択 + min/max） ---
         self.filter_form = QFormLayout()
-        layout.addLayout(self.filter_form)
-        self.min_edits = {}
-        self.max_edits = {}
+        main_layout.addLayout(self.filter_form)
 
         # --- テーブル ---
         self.table = QTableView()
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setAlternatingRowColors(True)
+
         # 右クリックメニュー
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
 
-        # Ctrl/Cmd + C でコピー（お好みで）
+        # Ctrl/Cmd + C でコピー
         copy_shortcut = QAction(self.table)
         copy_shortcut.setShortcut(QKeySequence.Copy)
         copy_shortcut.triggered.connect(self._copy_selected_rows_to_clipboard)
         self.table.addAction(copy_shortcut)
-        
-        self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.setAlternatingRowColors(True)
-        layout.addWidget(self.table)
 
-        # ボタン類
+        main_layout.addWidget(self.table)
+
+        # --- 下部ボタン群 ---
         btn_row_delete = QPushButton("Delete selected rows")
         btn_export_csv = QPushButton("Export to CSV")
         btn_row_delete.clicked.connect(self.delete_selected_rows)
         btn_export_csv.clicked.connect(self.export_current_view_to_csv)
+
         btn_box = QHBoxLayout()
         btn_box.addWidget(btn_row_delete)
         btn_box.addWidget(btn_export_csv)
-        layout.addLayout(btn_box)
+        main_layout.addLayout(btn_box)
 
-        # 戻る
+        # 戻るボタン
         back_btn = QPushButton("← Back to Main")
         back_btn.clicked.connect(self.go_back)
-        layout.addWidget(back_btn)
+        main_layout.addWidget(back_btn)
 
-        self.setLayout(layout)
+        self.setLayout(main_layout)
 
-        # 初期状態
-        self._build_filters()   # モードに応じたフィルタ欄
+        # シグナル接続（UI→挙動）
+        self.debug_all_cols.stateChanged.connect(
+            lambda _s: self._rebuild_table(self.debug_all_cols.isChecked())
+        )
+        self.rb_roll.toggled.connect(
+            lambda checked: checked and self._on_mode_changed("rolling")
+        )
+        self.rb_stand.toggled.connect(
+            lambda checked: checked and self._on_mode_changed("standing")
+        )
+        self.rb_fly.toggled.connect(
+            lambda checked: checked and self._on_mode_changed("flying")
+        )
+
+    # ---- フィルタ UI ----
+    def _build_filters(self):
+        # 既存行をクリア
+        while self.filter_form.rowCount():
+            self.filter_form.removeRow(0)
+
+        self.filter_kpi_combo = None
+        self.filter_min_edit = None
+        self.filter_max_edit = None
+        self._filter_stats = {}
+        self._current_filter_col = None
+
+        numeric_cols = self._display_kpi_columns()
+        if not numeric_cols or self.df_all.empty:
+            label = QLabel("KPI Filter: 利用可能な数値KPIがありません")
+            self.filter_form.addRow(label)
+            return
+
+        # Q1, Q3 を計算
+        num_df = self.df_all[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        q1 = num_df.quantile(0.25, numeric_only=True)
+        q3 = num_df.quantile(0.75, numeric_only=True)
+        for col in numeric_cols:
+            self._filter_stats[col] = (
+                float(q1[col]) if pd.notna(q1[col]) else None,
+                float(q3[col]) if pd.notna(q3[col]) else None,
+            )
+
+        row = QHBoxLayout()
+        combo = QComboBox()
+        combo.addItem("（フィルタなし）", userData=None)
+        for col in numeric_cols:
+            combo.addItem(col, userData=col)
+
+        min_edit = QLineEdit()
+        min_edit.setPlaceholderText("min（空なら第1四分位）")
+
+        max_edit = QLineEdit()
+        max_edit.setPlaceholderText("max（空なら第3四分位）")
+
+        row.addWidget(combo)
+        row.addWidget(min_edit)
+        row.addWidget(QLabel("〜"))
+        row.addWidget(max_edit)
+
+        self.filter_form.addRow("KPI Filter", row)
+
+        self.filter_kpi_combo = combo
+        self.filter_min_edit = min_edit
+        self.filter_max_edit = max_edit
+
+        combo.currentIndexChanged.connect(
+            lambda _i: self._on_filter_kpi_changed(combo.currentData())
+        )
+        min_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
+        max_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
+
+        # 初期状態（フィルタなし）
+        self._apply_filter_from_ui()
+
+    # ---- テーブル再構築 ----
+    def _rebuild_table(self, show_all: bool):
+        if self.df_all is None or self.df_all.empty:
+            self.model = DataFrameModel(pd.DataFrame())
+            self.proxy = RangeFilterProxy([])
+            self.proxy.setSourceModel(self.model)
+            self.table.setModel(self.proxy)
+            return
+
+        if "__row_id" not in self.df_all.columns:
+            self.df_all = self.df_all.copy()
+            self.df_all["__row_id"] = range(len(self.df_all))
+
+        df_current = self.df_all.copy()
+
+        if show_all:
+            all_cols = [
+                c for c in df_current.columns
+                if not (c.startswith("imputed__") or c == "__row_id")
+            ]
+
+            priority: list[str] = []
+            priority += [c for c in NAME_COLUMNS if c in all_cols]
+            priority += self._display_kpi_columns()
+
+            extras = [c for c in all_cols if c not in priority]
+
+            seen = set()
+            cols: list[str] = []
+            for c in priority + extras:
+                if c not in seen:
+                    cols.append(c)
+                    seen.add(c)
+        else:
+            cols = NAME_COLUMNS + self._display_kpi_columns()
+            cols = [
+                c for c in cols
+                if c in df_current.columns and not (c.startswith("imputed__") or c == "__row_id")
+            ]
+            if not cols:
+                cols = [
+                    c for c in df_current.columns
+                    if not (c.startswith("imputed__") or c == "__row_id")
+                ]
+
+        df_view = df_current[cols].copy()
+
+        # 赤字用マスク
+        mask_view = None
+        flag_map = {c: f"imputed__{c}" for c in cols}
+        if any(fc in self.df_all.columns for fc in flag_map.values()):
+            mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
+            for c, fc in flag_map.items():
+                if fc in self.df_all.columns:
+                    mask_view[c] = (
+                        self.df_all[fc].astype(bool).reindex(df_view.index).values
+                    )
+
+        self.model = DataFrameModel(df_view, mask_view)
+        self.proxy = RangeFilterProxy(df_view.columns.tolist())
+        self.proxy.setSourceModel(self.model)
+        self.table.setModel(self.proxy)
+
+        # 見た目調整
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+
+        default_width = 160
+        wider = {"first_name": 160, "last_name": 160}
+        visible_cols = list(self.model._df.columns)
+        for i, c in enumerate(visible_cols):
+            self.table.setColumnWidth(i, wider.get(c, default_width))
+        self.table.verticalHeader().setDefaultSectionSize(26)
+
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        # フィルタ再適用
+        if hasattr(self, "_current_filter_col"):
+            self.proxy.set_filter_column(self._current_filter_col)
+            self._apply_filter_from_ui()
+
+    # ---- フィルタ挙動 ----
+    def _on_filter_kpi_changed(self, col_name: str | None):
+        self._current_filter_col = col_name
+        self._apply_filter_from_ui()
+
+    def _on_filter_value_changed(self):
+        self._apply_filter_from_ui()
+
+    def _apply_filter_from_ui(self):
+        if not hasattr(self, "proxy"):
+            return
+
+        col = self._current_filter_col
+        if not col:
+            self.proxy.set_filter_column(None)
+            self.proxy.set_range(None, None)
+            return
+
+        if not self.filter_min_edit or not self.filter_max_edit:
+            self.proxy.set_filter_column(None)
+            self.proxy.set_range(None, None)
+            return
+
+        tmin = self.filter_min_edit.text().strip()
+        tmax = self.filter_max_edit.text().strip()
+        q1, q3 = self._filter_stats.get(col, (None, None))
+
+        # ★ここがポイント：
+        # 両方空欄で、Q1/Q3が計算できているときは
+        # 実際にテキストボックスへQ1〜Q3を入れて見えるようにする
+        if tmin == "" and tmax == "" and (q1 is not None or q3 is not None):
+            self.filter_min_edit.blockSignals(True)
+            self.filter_max_edit.blockSignals(True)
+            if q1 is not None:
+                self.filter_min_edit.setText(f"{q1:.3f}")
+                tmin = self.filter_min_edit.text().strip()
+            if q3 is not None:
+                self.filter_max_edit.setText(f"{q3:.3f}")
+                tmax = self.filter_max_edit.text().strip()
+            self.filter_min_edit.blockSignals(False)
+            self.filter_max_edit.blockSignals(False)
+
+        def parse_or_default(text: str, default: float | None):
+            if text == "":
+                return default
+            try:
+                return float(text)
+            except Exception:
+                return default
+
+        vmin = parse_or_default(tmin, q1)
+        vmax = parse_or_default(tmax, q3)
+
+        # Q1, Q3 どちらも取れない場合はフィルタ無し扱い
+        if vmin is None and vmax is None:
+            self.proxy.set_filter_column(None)
+            self.proxy.set_range(None, None)
+            return
+
+        self.proxy.set_filter_column(col)
+        self.proxy.set_range(vmin, vmax)
+
+
+    # ---- モード変更 ----
+    def _on_mode_changed(self, mode: str):
+        if mode == getattr(self, "time_mode", None):
+            return
+        self.time_mode = mode
+        self._settings.setdefault("ui", {})["time_mode"] = mode
+        _save_json(SETTINGS_PATH, self._settings)
+
+        self._build_filters()
         self._rebuild_table(self.debug_all_cols.isChecked())
 
-        # トグル/モードのイベント
-        self.debug_all_cols.stateChanged.connect(lambda _s: self._rebuild_table(self.debug_all_cols.isChecked()))
-        self.rb_roll.toggled.connect(lambda checked: checked and self._on_mode_changed("rolling"))
-        self.rb_stand.toggled.connect(lambda checked: checked and self._on_mode_changed("standing"))
-        self.rb_fly.toggled.connect(lambda checked: checked and self._on_mode_changed("flying"))
+    # ---- 戻る ----
+    def go_back(self):
+        sw = self.stacked_widget
+        idx = sw.indexOf(self)
+        if idx != -1:
+            sw.removeWidget(self)
+        sw.setCurrentIndex(0)
 
+    # ---- 行削除 ----
+    def delete_selected_rows(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Delete", "Please select rows to delete")
+            return
+
+        if QMessageBox.question(
+            self,
+            "Delete Rows",
+            f"{len(sel)} rows will be deleted. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
+        source_rows = sorted({self.proxy.mapToSource(i).row() for i in sel})
+
+        if "__row_id" in self.df_all.columns:
+            row_ids = self.df_all.iloc[source_rows]["__row_id"].tolist()
+            self.df_all.drop(
+                self.df_all.index[self.df_all["__row_id"].isin(row_ids)], inplace=True
+            )
+        else:
+            self.df_all.drop(self.df_all.index[source_rows], inplace=True)
+
+        self.df_all.reset_index(drop=True, inplace=True)
+        self._rebuild_table(self.debug_all_cols.isChecked())
+
+    # ---- CSVエクスポート ----
+    def export_current_view_to_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save CSV", "kpi_export.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+
+        rows = [
+            self.proxy.mapToSource(self.proxy.index(r, 0)).row()
+            for r in range(self.proxy.rowCount())
+        ]
+        export_df = self.df_all.iloc[rows].copy()
+
+        drop_cols = [
+            c for c in export_df.columns if c.startswith("imputed__")
+        ] + ["__row_id"]
+        export_df.drop(
+            columns=[c for c in drop_cols if c in export_df.columns],
+            inplace=True,
+            errors="ignore",
+        )
+
+        try:
+            export_df.to_csv(path, index=False, encoding="utf-8-sig")
+            QMessageBox.information(self, "Export", f"CSV Saved:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", f"Save failed:\n{e}")
+
+    # ---- 右クリックメニュー / クリップボードコピー ----
     def _on_table_context_menu(self, pos: QPoint):
         tv = self.table
         idx = tv.indexAt(pos)
         sel = tv.selectionModel()
 
-        # 右クリックした行を選択に含める（未選択や別行を右クリックしたとき）
         if idx.isValid() and not sel.isSelected(idx):
             tv.selectRow(idx.row())
 
@@ -351,15 +966,12 @@ class KPIPage(QWidget):
         menu.exec_(tv.viewport().mapToGlobal(pos))
 
     def _copy_selected_rows_to_clipboard(self):
-        """現在のビュー（フィルタ＆ソート後）の選択行をTSVでコピー。
-        見出しは可視列のみ、値はDisplayRole（表示と同じ書式）。"""
         tv = self.table
-        model = tv.model()                 # これは proxy（QSortFilterProxyModel）
+        model = tv.model()
         sel = tv.selectionModel()
         if not sel or not sel.hasSelection():
             return
 
-        # 可視カラム（非表示は除外）とヘッダ
         visible_cols = []
         headers = []
         for c in range(model.columnCount()):
@@ -368,12 +980,10 @@ class KPIPage(QWidget):
                 hdr = model.headerData(c, Qt.Horizontal)
                 headers.append("" if hdr is None else str(hdr))
 
-        # 選択された行番号（ビュー基準、昇順）
         rows = sorted({i.row() for i in sel.selectedIndexes()})
         if not rows:
             rows = sorted(i.row() for i in sel.selectedRows())
 
-        # TSV組み立て（DisplayRoleで現在表示の文字列を取得）
         lines = ["\t".join(headers)]
         for r in rows:
             vals = []
@@ -387,23 +997,20 @@ class KPIPage(QWidget):
         QGuiApplication.clipboard().setText(tsv)
         print(f"[KPI] {len(rows)} 行をクリップボードへコピーしました")
 
+    # ---- リロード ----
     def _reload_kpi(self):
         print("[KPI] リロード開始")
-        df_any, _users = fetch_df_from_db(self._base_query, progress=lambda m: print(f"[KPI] {m}"))
 
-        self.df_all = df_any.copy()
-
-        # __row_id を必要なら付与（_rebuild_table が期待）
-        if "__row_id" not in self.df_all.columns:
-            self.df_all["__row_id"] = range(len(self.df_all))
-
-        # self.df_all = self._filter_sb1_once_between_fp_0m(self.df_all, self._user_ids)
-
-        # 現在のソート状態を保持→再適用
+        # 現在のソートを覚えておく
         hh = self.table.horizontalHeader()
         sort_col = hh.sortIndicatorSection()
         sort_ord = hh.sortIndicatorOrder()
 
+        # データを再読込
+        self._load_data_and_prepare_kpi()
+
+        # フィルタはモードに合わせて作り直し
+        self._build_filters()
         self._rebuild_table(self.debug_all_cols.isChecked())
 
         # ソート復元
@@ -414,322 +1021,23 @@ class KPIPage(QWidget):
 
         print("[KPI] リロード完了")
 
+    def _reload_kpi_json(self):
+        print("[KPI] kpi.json リロード開始")
 
+        # kpi.json を読み直し
+        self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
 
-    # ---- ヘルパ----
-    def _current_kpi_columns(self):
-        """
-        KPIフィルタ対象の列を、モード(self.time_mode)に応じて最小集合に絞る。
-        R/S:   000-125 だけ
-        FLY:   000-200 だけ
-        ※復活用の候補はコメントで残す
-        """
-        mode = (getattr(self, "time_mode", "FLY") or "FLY").upper()
+        # 新しい定義に基づいて区間列を追加（既にある列はスキップされる）
+        self._ensure_interval_columns()
 
-        if mode == "RS":
-            allowed = ["Time000to125"]
-            # 復活候補:
-            # allowed = ["Time000to625", "Time625to125", "Time000to125"]
-        else:  # FLY (既定)
-            allowed = ["Time000to200"]
-            # 復活候補:
-            # allowed = ["Time000to100", "Time100to200", "Time000to200"]
-
-        # 実際にデータフレームに存在する列だけ返す
-        cols_in_df = [c for c in allowed if c in getattr(self, "df_all", {}).columns]
-        return cols_in_df
-
-    def _display_kpi_columns(self):
-        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
-        if mode == "rolling":
-            allowed = ["Time000to125_roll", "Time125to250"]
-        elif mode == "standing":
-            allowed = ["Time000to125_stand", "Time125to250"]
-        else:  # flying
-            allowed = ["Time000to100", "Time100to200", "Time000to200"]
-
-        present = set(self.df_all.columns) | set((getattr(self, "_kpi_by_mode", {}) or {}).get(mode, {}).keys())
-        return [c for c in allowed if c in present]
-
-    
-    def _filter_kpi_columns(self):
-        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
-        if mode == "rolling":
-            # 新列優先、なければ旧列にフォールバック
-            return [c for c in ["Time000to125_roll", "Time000to125"] if c in self.df_all.columns] or ["Time000to125_roll"]
-        elif mode == "standing":
-            return [c for c in ["Time000to125_stand", "Time000to125"] if c in self.df_all.columns] or ["Time000to125_stand"]
-        else:  # flying
-            return ["Time000to200"]
-
-    def _filter_sb1_once_between_fp_0m(self, df: pd.DataFrame, user_ids):
-        """
-        SB1は「(各 user_id の文脈で) 直前FP〜最初の0m の“間”に ちょうど1回だけ 出た」ものだけ残す。
-        FP/0m/その他の地点はそのまま残す。
-        """
-        if df.empty or "position" not in df.columns or "timestamp" not in df.columns:
-            return df
-
-        gdf = df.sort_values("timestamp").reset_index(drop=True).copy()
-
-        # 最終的に残す SB1 を集約（複数選手に対して OR で結合）
-        sb1_keep_any = pd.Series(False, index=gdf.index)
-
-        for uid in user_ids:
-            is_fp  = (gdf["position"] == "FP")  & (gdf["user_id"] == uid)
-            is_0m  = (gdf["position"] == "0m")  & (gdf["user_id"] == uid)
-            is_sb1 = (gdf["position"] == "SB1")
-
-            # 区間ID（この選手のFPのみでカウント）
-            fp_cum = is_fp.cumsum()
-            z0_cum = is_0m.cumsum()
-
-            # この選手の文脈で「直前FPがあり、まだ0mが来ていない」区間
-            between = fp_cum.gt(z0_cum)
-
-            # “最初の0m”が存在する区間のみ有効
-            has_0m_by_interval = (
-                is_0m.groupby(fp_cum).transform("max").astype(bool)
-            )
-
-            # FP〜最初の0m の“間”の SB1
-            sb1_between = is_sb1 & between & has_0m_by_interval
-
-            # 各区間の SB1 件数
-            sb1_cnt = sb1_between.groupby(fp_cum).transform("sum")
-
-            # その区間で SB1 がちょうど1件のときだけ、その SB1 を残す
-            sb1_keep_uid = sb1_between & (sb1_cnt == 1)
-
-            # 複数選手分を統合（どれかの選手文脈で条件を満たせば採用）
-            sb1_keep_any |= sb1_keep_uid
-
-        # 非SB1は常に残す。SB1は keep_any のみ残す
-        mask_keep = (gdf["position"] != "SB1") | sb1_keep_any
-        return gdf[mask_keep].reset_index(drop=True)
-
-
-    # ---- フィルタUIをビルド（モードごとに作り直し）----
-    def _build_filters(self):
-        # 既存行をクリア
-        while self.filter_form.rowCount():
-            self.filter_form.removeRow(0)
-        self.min_edits.clear()
-        self.max_edits.clear()
-
-        # 数値列（モードの標準KPI列のみ）
-        numeric_cols = self._filter_kpi_columns()
-
-        validator = QDoubleValidator()
-        for col in numeric_cols:
-            label_text = FILTER_LABELS.get(col, col)
-            row = QHBoxLayout()
-            min_edit = QLineEdit(); min_edit.setPlaceholderText("min"); min_edit.setValidator(validator)
-            max_edit = QLineEdit(); max_edit.setPlaceholderText("max"); max_edit.setValidator(validator)
-            # 変更時：プロキシへ適用＆設定ファイルにも保存
-            min_edit.textChanged.connect(lambda _t, c=col, me=min_edit, xe=max_edit: self._on_filter_changed(c, me.text(), xe.text()))
-            max_edit.textChanged.connect(lambda _t, c=col, me=min_edit, xe=max_edit: self._on_filter_changed(c, me.text(), xe.text()))
-            row.addWidget(min_edit); row.addWidget(QLabel("〜")); row.addWidget(max_edit)
-            self.filter_form.addRow(label_text, row)
-            self.min_edits[col] = min_edit
-            self.max_edits[col] = max_edit
-
-        # 初期値の適用：setting.json に保存済みがあれば優先し、無ければ自動計算した値を使う
-        if numeric_cols:
-            # 自動計算の下限/上限
-            num_df = self.df_all[numeric_cols].apply(pd.to_numeric, errors="coerce")
-            auto_min = num_df.min(skipna=True)
-            auto_max = num_df.max(skipna=True)
-            # 設定から取得
-            fr = self._settings.get("filter_ranges", {}).get(self.time_mode, {})
-            for c in numeric_cols:
-                saved = fr.get(c, {})
-                vmin = saved.get("min", None)
-                vmax = saved.get("max", None)
-                # 文字列をそのまま使う（空文字も可）。無ければ自動推定値を入れて見やすく。
-                if vmin is None and pd.notna(auto_min.get(c)):
-                    vmin = f"{float(auto_min.get(c)):.3f}"
-                if vmax is None and pd.notna(auto_max.get(c)):
-                    vmax = f"{float(auto_max.get(c)):.3f}"
-                # UIへ反映（シグナルは一旦止める）
-                self.min_edits[c].blockSignals(True); self.min_edits[c].setText("" if vmin is None else str(vmin)); self.min_edits[c].blockSignals(False)
-                self.max_edits[c].blockSignals(True); self.max_edits[c].setText("" if vmax is None else str(vmax)); self.max_edits[c].blockSignals(False)
-                # プロキシへも反映
-                if hasattr(self, "proxy"):
-                    self.proxy.setRange(c, self.min_edits[c].text(), self.max_edits[c].text())
-
-    # ---- 表の作り直し（全列 or 標準列）----
-    def _rebuild_table(self, show_all: bool):
-        if self.df_all is None:
-            self.model = DataFrameModel(pd.DataFrame())
-            self.proxy = RangeFilterProxy([])
-            self.proxy.setSourceModel(self.model)
-            self.table.setModel(self.proxy)
-            return
-
-        # 1) 表示用DFを作成（元dfは変更しない）
-        if "__row_id" not in self.df_all.columns:
-            self.df_all = self.df_all.copy()
-            self.df_all["__row_id"] = range(len(self.df_all))
-
-        df_current = self.df_all.copy()
-
-        # ★ 2) KPIだけモードの結果で上書き（事前に self._kpi_by_mode を用意しておく）
-        mode = (getattr(self, "time_mode", "rolling") or "rolling").lower()
-        for col, series in (getattr(self, "_kpi_by_mode", {}) or {}).get(mode, {}).items():
-            try:
-                df_current[col] = series
-            except Exception:
-                # 長さ不一致などで失敗しても安全にスキップ
-                pass
-
-        # 3) 表示列の決定
-        if show_all:
-            # 1) 表示対象（imputed/__row_id 除外）
-            all_cols = [c for c in df_current.columns
-                        if not (c.startswith("imputed__") or c == "__row_id")]
-
-            # 2) 優先配置リスト = 名前列 + モード既定KPI（存在チェックは _display_kpi_columns 内で済む）
-            priority = []
-            priority += [c for c in NAME_COLUMNS if c in all_cols]
-            priority += self._display_kpi_columns()  # ← rolling/standing/flying の“既定KPI”順
-
-            # 3) 残りは元の順のまま後ろへ
-            extras = [c for c in all_cols if c not in priority]
-
-            # 4) 重複除去して順序維持
-            seen = set()
-            cols = []
-            for c in priority + extras:
-                if c not in seen:
-                    cols.append(c)
-                    seen.add(c)
-        else:
-            # （非 show_all の分岐はそのまま）
-            cols = NAME_COLUMNS + self._display_kpi_columns()
-            cols = [c for c in cols if c in df_current.columns and not (c.startswith("imputed__") or c == "__row_id")]
-            if not cols:
-                cols = [c for c in df_current.columns if not (c.startswith("imputed__") or c == "__row_id")]
-
-
-        df_view = df_current[cols].copy()
-
-        # 4) 赤字用マスク（imputed__* は元dfのフラグを参照）
-        mask_view = None
-        flag_map = {c: f"imputed__{c}" for c in cols}
-        if any(fc in self.df_all.columns for fc in flag_map.values()):
-            mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
-            for c, fc in flag_map.items():
-                if fc in self.df_all.columns:
-                    mask_view[c] = self.df_all[fc].astype(bool).reindex(df_view.index).values
-
-        # 5) モデル/プロキシ
-        self.model = DataFrameModel(df_view, mask_view)
-        self.proxy = RangeFilterProxy(df_view.columns.tolist())
-        self.proxy.setSourceModel(self.model)
-        self.table.setModel(self.proxy)
-
-        # 6) 見た目調整
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.Interactive)
-
-        default_width = 160
-        wider = {
-            "first_name": 160,
-            "last_name": 160,
-        }
-        visible_cols = list(self.model._df.columns)
-        for i, c in enumerate(visible_cols):
-            self.table.setColumnWidth(i, wider.get(c, default_width))
-        self.table.verticalHeader().setDefaultSectionSize(26)
-
-        # 7) 既存フィルタ値を反映
-        for c, me in self.min_edits.items():
-            xe = self.max_edits[c]
-            self.proxy.setRange(c, me.text(), xe.text())
-
-        # 8) 複数行選択
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-    # ---- モード変更 ----
-    def _on_mode_changed(self, mode: str):
-        if mode == getattr(self, "time_mode", None):
-            return
-        self.time_mode = mode
-        self._settings.setdefault("ui", {})["time_mode"] = mode
-        _save_json(SETTINGS_PATH, self._settings)
-        # フィルタ欄を作り直し（モードの標準KPI列に合わせる）
+        # フィルタとテーブルを作り直し
         self._build_filters()
-        # テーブルを再構築
         self._rebuild_table(self.debug_all_cols.isChecked())
 
-    def go_back(self):
-        sw = self.stacked_widget
-        idx = sw.indexOf(self)
-        if idx != -1:
-            sw.removeWidget(self)
-        sw.setCurrentIndex(0)
+        print("[KPI] kpi.json リロード完了")
 
-    def delete_selected_rows(self):
-        sel = self.table.selectionModel().selectedRows()
-        if not sel:
-            QMessageBox.information(self, "Delete", "Please select rows to delete")
-            return
-        if QMessageBox.question(
-            self, "Delete Rows",
-            f"{len(sel)} rows will be deleted. Continue?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        ) != QMessageBox.Yes:
-            return
-
-        # プロキシ行 → ソース行
-        source_rows = sorted({ self.proxy.mapToSource(i).row() for i in sel })
-
-        # __row_id が無い環境でも安全に落ちないように保険
-        if "__row_id" in self.df_all.columns:
-            # __row_id で消す
-            row_ids = self.df_all.iloc[source_rows]["__row_id"].tolist()
-            self.df_all.drop(self.df_all.index[self.df_all["__row_id"].isin(row_ids)], inplace=True)
-        else:
-            # 素直に index で消す（並びに注意）
-            self.df_all.drop(self.df_all.index[source_rows], inplace=True)
-
-        self.df_all.reset_index(drop=True, inplace=True)
-        self._rebuild_table(self.debug_all_cols.isChecked())
-
-    def export_current_view_to_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "kpi_export.csv", "CSV Files (*.csv)")
-        if not path:
-            return
-
-        # フィルタ後の行だけ抽出し、列は df_all の“全列”で出力
-        rows = [ self.proxy.mapToSource(self.proxy.index(r, 0)).row()
-                 for r in range(self.proxy.rowCount()) ]
-        export_df = self.df_all.iloc[rows].copy()
-
-        # 内部列があれば除外（保険）
-        drop_cols = [c for c in export_df.columns if c.startswith("imputed__")] + ["__row_id"]
-        export_df.drop(columns=[c for c in drop_cols if c in export_df.columns],
-                       inplace=True, errors="ignore")
-
-        try:
-            export_df.to_csv(path, index=False, encoding="utf-8-sig")
-            QMessageBox.information(self, "Export", f"CSV Saved:\n{path}")
-        except Exception as e:
-            QMessageBox.warning(self, "Export Failed", f"Save failed:\n{e}")
-
-    def _on_filter_changed(self, col_name: str, vmin: str, vmax: str):
-        # プロキシへ反映
-        if hasattr(self, "proxy"):
-            self.proxy.setRange(col_name, vmin, vmax)
-        # 設定に保存
-        if "filter_ranges" not in self._settings:
-            self._settings["filter_ranges"] = {}
-        if self.time_mode not in self._settings["filter_ranges"]:
-            self._settings["filter_ranges"][self.time_mode] = {}
-        self._settings["filter_ranges"][self.time_mode][col_name] = {
-            "min": vmin if vmin is not None else "",
-            "max": vmax if vmax is not None else "",
-        }
-        _save_json(SETTINGS_PATH, self._settings)
+    def _open_kpi_json_editor(self):
+        """kpi.json編集ページへ遷移"""
+        editor = KPIJsonEditorPage(self)
+        self.stacked_widget.addWidget(editor)
+        self.stacked_widget.setCurrentWidget(editor)
