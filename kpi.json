@@ -8,6 +8,10 @@
       "start": "100m",
       "end": "50m",
       "name": "100→次周50"
+    },
+    {
+      "start": "AP1",
+      "end": "BP"
     }
   ],
   "standing": [
@@ -16,5 +20,14 @@
       "end": "BP"
     }
   ],
-  "flying": []
+  "flying": [
+    {
+      "start": "FP_start",
+      "end": "60m"
+    },
+    {
+      "start": "0m_start",
+      "end": "50m"
+    }
+  ]
 }

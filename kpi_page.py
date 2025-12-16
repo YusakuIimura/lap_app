@@ -22,7 +22,6 @@ from utils import fetch_df_from_db
 
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
 KPI_INTERVALS_PATH = os.path.join(os.getcwd(), "kpi.json")
-TRACK_IMAGE_PATH = os.path.join(os.path.dirname(__file__), "track-ref.jpg")
 
 TRACK_ORDER = [
     "FP_start",
@@ -228,27 +227,27 @@ class KPIJsonEditorPage(QWidget):
     # UI 構築
     # ------------------------------------------------------------------
     def _build_ui(self):
-        self.setWindowTitle("KPI設定の編集")
+        self.setWindowTitle("Edit KPI")
         main = QVBoxLayout()
 
         # 画像エリア
         img_label = QLabel()
-        if os.path.exists(TRACK_IMAGE_PATH):
-            pix = QPixmap(TRACK_IMAGE_PATH)
+        path = getattr(self.kpi_page, "track_image_path", "")
+        if path and os.path.exists(path):
+            pix = QPixmap(path)
             if not pix.isNull():
-                # 幅に合わせて縮小（高さは自動）
                 pix = pix.scaledToWidth(900, Qt.SmoothTransformation)
                 img_label.setPixmap(pix)
                 img_label.setAlignment(Qt.AlignCenter)
             else:
-                img_label.setText(f"画像を読み込めません: {TRACK_IMAGE_PATH}")
+                img_label.setText(f"Cannot load image: {path}")
         else:
-            img_label.setText(f"トラック画像が見つかりません: {TRACK_IMAGE_PATH}")
+            img_label.setText(f"Track image not found: {path}")
         main.addWidget(img_label)
 
         # モード選択
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("モード:"))
+        mode_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Rolling", userData="rolling")
         self.mode_combo.addItem("Standing", userData="standing")
@@ -260,7 +259,7 @@ class KPIJsonEditorPage(QWidget):
 
         # 現在の定義一覧テーブル
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["表示名", "start", "end"])
+        self.table.setHorizontalHeaderLabels(["Display Name", "start", "end"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -273,16 +272,16 @@ class KPIJsonEditorPage(QWidget):
         self.end_combo = QComboBox()
         self.end_combo.addItems(self.available_points)
         self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("表示名（空なら start-end）")
+        self.name_edit.setPlaceholderText("Display Name（start-end if empty）")
 
         add_row.addWidget(QLabel("start:"))
         add_row.addWidget(self.start_combo)
         add_row.addWidget(QLabel("end:"))
         add_row.addWidget(self.end_combo)
-        add_row.addWidget(QLabel("表示名:"))
+        add_row.addWidget(QLabel("Display Name:"))
         add_row.addWidget(self.name_edit)
 
-        self.btnAdd = QPushButton("追加")
+        self.btnAdd = QPushButton("Add")
         self.btnAdd.clicked.connect(self._on_add_clicked)
         add_row.addWidget(self.btnAdd)
 
@@ -290,17 +289,17 @@ class KPIJsonEditorPage(QWidget):
 
         # 操作用ボタン
         btn_row = QHBoxLayout()
-        self.btnDelete = QPushButton("選択行を削除")
+        self.btnDelete = QPushButton("Delete Selected Row")
         self.btnDelete.clicked.connect(self._on_delete_clicked)
         btn_row.addWidget(self.btnDelete)
 
         btn_row.addStretch()
 
-        self.btnCancel = QPushButton("キャンセル")
+        self.btnCancel = QPushButton("Cancel")
         self.btnCancel.clicked.connect(self._on_cancel_clicked)
         btn_row.addWidget(self.btnCancel)
 
-        self.btnSave = QPushButton("保存して戻る")
+        self.btnSave = QPushButton("Save and Back")
         self.btnSave.clicked.connect(self._on_save_clicked)
         btn_row.addWidget(self.btnSave)
 
@@ -340,7 +339,7 @@ class KPIJsonEditorPage(QWidget):
         name = self.name_edit.text().strip()
 
         if not start or not end:
-            QMessageBox.warning(self, "追加できません", "start と end を選択してください。")
+            QMessageBox.warning(self, "Cannot add.", "Please select both start and end.")
             return
 
         entry = {"start": start, "end": end}
@@ -377,7 +376,7 @@ class KPIJsonEditorPage(QWidget):
         try:
             _save_json(KPI_INTERVALS_PATH, self._config)
         except Exception as e:
-            QMessageBox.warning(self, "保存失敗", f"kpi.json の保存に失敗しました:\n{e}")
+            QMessageBox.warning(self, "Save Failed", f"Failed to save kpi.json:\n{e}")
             return
 
         # 親ページに反映してテーブル更新
@@ -386,7 +385,7 @@ class KPIJsonEditorPage(QWidget):
         self.kpi_page._build_filters()
         self.kpi_page._rebuild_table(self.kpi_page.debug_all_cols.isChecked())
 
-        QMessageBox.information(self, "保存完了", "kpi.json を保存しました。")
+        QMessageBox.information(self, "Saved Successfully", "kpi.json has been saved.")
 
         sw = self.stacked_widget
         sw.setCurrentWidget(self.kpi_page)
@@ -446,7 +445,9 @@ class KPIPage(QWidget):
         # フィルタ・テーブル初期化
         self._build_filters()
         self._rebuild_table(self.debug_all_cols.isChecked())
-
+        
+        self.track_image_path = self._settings.get("image_path", "")
+ 
     # ------------------------------------------------------------------
     # データロジック
     # ------------------------------------------------------------------
@@ -598,11 +599,11 @@ class KPIPage(QWidget):
         top_row.addWidget(self.rb_stand)
         top_row.addWidget(self.rb_fly)
 
-        self.btnReload = QPushButton("最新情報に更新", self)
+        self.btnReload = QPushButton("Updata to Latest", self)
         self.btnReload.clicked.connect(self._reload_kpi)
         top_row.addWidget(self.btnReload)
         
-        self.btnEditKpiJson = QPushButton("KPI設定を編集", self)
+        self.btnEditKpiJson = QPushButton("Edit KPI Setting", self)
         self.btnEditKpiJson.clicked.connect(self._open_kpi_json_editor)
         top_row.addWidget(self.btnEditKpiJson)
 
@@ -698,15 +699,15 @@ class KPIPage(QWidget):
 
         row = QHBoxLayout()
         combo = QComboBox()
-        combo.addItem("（フィルタなし）", userData=None)
+        combo.addItem("（No Filter）", userData=None)
         for col in numeric_cols:
             combo.addItem(col, userData=col)
 
         min_edit = QLineEdit()
-        min_edit.setPlaceholderText("min（空なら第1四分位）")
+        min_edit.setPlaceholderText("min（Fallback to first quartile if empty）")
 
         max_edit = QLineEdit()
-        max_edit.setPlaceholderText("max（空なら第3四分位）")
+        max_edit.setPlaceholderText("max（Fallback to third quartile if empty）")
 
         row.addWidget(combo)
         row.addWidget(min_edit)
