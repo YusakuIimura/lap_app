@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox,
-    QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup, QHeaderView,
+    QAbstractItemView, QMessageBox, QFileDialog, QHeaderView,
     QMenu, QAction, QComboBox,QTableWidget, QTableWidgetItem
 )
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QPoint
@@ -304,7 +304,12 @@ class KPIJsonEditorPage(QWidget):
             # 元の設定をコピーして編集用に保持
             import copy
             self._config = copy.deepcopy(kpi_page._interval_config) or {}
-            for key in ("rolling", "standing", "flying"):
+            # kpi.jsonのキーを取得して、存在しないキーには空リストを設定
+            mode_keys = list(self._config.keys())
+            if not mode_keys:
+                # デフォルト値（kpi.jsonが空の場合）
+                mode_keys = ["training1", "training2", "training3"]
+            for key in mode_keys:
                 self._config.setdefault(key, [])
 
             # start/end で選べる地点（df_all にある列だけを採用）
@@ -348,13 +353,19 @@ class KPIJsonEditorPage(QWidget):
             img_label.setText(f"Track image not found: {path}")
         main.addWidget(img_label)
 
-        # モード選択
+        # モード選択（kpi.jsonのキーから動的に生成）
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Rolling", userData="rolling")
-        self.mode_combo.addItem("Standing", userData="standing")
-        self.mode_combo.addItem("Flying", userData="flying")
+        # kpi.jsonからキーを取得して選択肢を追加
+        mode_keys = list(self._config.keys()) if self._config else []
+        if not mode_keys:
+            # デフォルト値（kpi.jsonが空の場合）
+            mode_keys = ["training1", "training2", "training3"]
+        for key in sorted(mode_keys):
+            # キー名を表示名に変換（先頭大文字）
+            display_name = key.capitalize()
+            self.mode_combo.addItem(display_name, userData=key)
         self.mode_combo.currentIndexChanged.connect(self._refresh_mode_entries)
         mode_row.addWidget(self.mode_combo)
         mode_row.addStretch()
@@ -752,21 +763,28 @@ class KPIPage(QWidget):
         self.debug_all_cols.setChecked(False)
         top_row.addWidget(self.debug_all_cols)
 
-        self.mode_group = QButtonGroup(self)
-        self.rb_roll = QRadioButton("Rolling")
-        self.rb_stand = QRadioButton("Standing")
-        self.rb_fly = QRadioButton("Flying")
-        self.mode_group.addButton(self.rb_roll)
-        self.mode_group.addButton(self.rb_stand)
-        self.mode_group.addButton(self.rb_fly)
-
-        self.rb_roll.setChecked(self.time_mode == "rolling")
-        self.rb_stand.setChecked(self.time_mode == "standing")
-        self.rb_fly.setChecked(self.time_mode == "flying")
-
-        top_row.addWidget(self.rb_roll)
-        top_row.addWidget(self.rb_stand)
-        top_row.addWidget(self.rb_fly)
+        # モード選択ドロップダウン（kpi.jsonのキーから動的に生成）
+        mode_container = QWidget()
+        mode_layout = QHBoxLayout(mode_container)
+        mode_layout.setSpacing(0)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        # kpi.jsonからキーを取得して選択肢を追加
+        mode_keys = list(self._interval_config.keys()) if self._interval_config else []
+        if not mode_keys:
+            # デフォルト値（kpi.jsonが空の場合）
+            mode_keys = ["training1", "training2", "training3"]
+        for key in sorted(mode_keys):
+            # キー名を表示名に変換（先頭大文字）
+            display_name = key.capitalize()
+            self.mode_combo.addItem(display_name, userData=key)
+        # 現在のモードを選択
+        current_index = self.mode_combo.findData(self.time_mode)
+        if current_index >= 0:
+            self.mode_combo.setCurrentIndex(current_index)
+        mode_layout.addWidget(self.mode_combo)
+        top_row.addWidget(mode_container)
 
         self.btnReload = QPushButton("Updata to Latest", self)
         self.btnReload.clicked.connect(self._reload_kpi)
@@ -828,14 +846,8 @@ class KPIPage(QWidget):
         self.debug_all_cols.stateChanged.connect(
             lambda _s: self._rebuild_table(self.debug_all_cols.isChecked())
         )
-        self.rb_roll.toggled.connect(
-            lambda checked: checked and self._on_mode_changed("rolling")
-        )
-        self.rb_stand.toggled.connect(
-            lambda checked: checked and self._on_mode_changed("standing")
-        )
-        self.rb_fly.toggled.connect(
-            lambda checked: checked and self._on_mode_changed("flying")
+        self.mode_combo.currentIndexChanged.connect(
+            lambda _i: self._on_mode_changed(self.mode_combo.currentData())
         )
 
     # ---- フィルタ UI ----
@@ -1070,8 +1082,10 @@ class KPIPage(QWidget):
 
 
     # ---- モード変更 ----
-    def _on_mode_changed(self, mode: str):
+    def _on_mode_changed(self, mode: str | None):
         try:
+            if mode is None:
+                return
             if mode == getattr(self, "time_mode", None):
                 return
             self.time_mode = mode
@@ -1271,8 +1285,31 @@ class KPIPage(QWidget):
             except Exception:
                 pass
 
+            # 現在のモードを覚えておく
+            current_mode = getattr(self, "time_mode", "rolling")
+
             # データを再読込
             self._load_data_and_prepare_kpi()
+
+            # ドロップダウンの選択肢を更新
+            if hasattr(self, "mode_combo"):
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.clear()
+                mode_keys = list(self._interval_config.keys()) if self._interval_config else []
+                if not mode_keys:
+                    mode_keys = ["training1", "training2", "training3"]
+                for key in sorted(mode_keys):
+                    display_name = key.capitalize()
+                    self.mode_combo.addItem(display_name, userData=key)
+                # 現在のモードを選択（存在しない場合は最初の項目）
+                current_index = self.mode_combo.findData(current_mode)
+                if current_index >= 0:
+                    self.mode_combo.setCurrentIndex(current_index)
+                else:
+                    self.mode_combo.setCurrentIndex(0)
+                    if self.mode_combo.count() > 0:
+                        current_mode = self.mode_combo.currentData()
+                self.mode_combo.blockSignals(False)
 
             # フィルタはモードに合わせて作り直し
             self._build_filters()
@@ -1295,8 +1332,31 @@ class KPIPage(QWidget):
     def _reload_kpi_json(self):
         print("[KPI] kpi.json リロード開始")
 
+        # 現在のモードを覚えておく
+        current_mode = getattr(self, "time_mode", "training1")
+
         # kpi.json を読み直し
         self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
+
+        # ドロップダウンの選択肢を更新
+        if hasattr(self, "mode_combo"):
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.clear()
+            mode_keys = list(self._interval_config.keys()) if self._interval_config else []
+            if not mode_keys:
+                mode_keys = ["training1", "training2", "training3"]
+            for key in sorted(mode_keys):
+                display_name = key.capitalize()
+                self.mode_combo.addItem(display_name, userData=key)
+            # 現在のモードを選択（存在しない場合は最初の項目）
+            current_index = self.mode_combo.findData(current_mode)
+            if current_index >= 0:
+                self.mode_combo.setCurrentIndex(current_index)
+            else:
+                self.mode_combo.setCurrentIndex(0)
+                if self.mode_combo.count() > 0:
+                    current_mode = self.mode_combo.currentData()
+            self.mode_combo.blockSignals(False)
 
         # 新しい定義に基づいて区間列を追加（既にある列はスキップされる）
         self._ensure_interval_columns()

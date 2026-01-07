@@ -1,5 +1,5 @@
 {
-  "rolling": [
+  "training1": [
     {
       "start": "50m",
       "end": "100m"
@@ -14,13 +14,13 @@
       "end": "BP"
     }
   ],
-  "standing": [
+  "training2": [
     {
       "start": "SB1",
       "end": "BP"
     }
   ],
-  "flying": [
+  "training3": [
     {
       "start": "FP_start",
       "end": "60m"
@@ -29,5 +29,6 @@
       "start": "0m_start",
       "end": "50m"
     }
-  ]
+  ],
+  "training4":[]
 }
