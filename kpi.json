@@ -1,34 +1,51 @@
 {
-  "training1": [
-    {
-      "start": "50m",
-      "end": "100m"
-    },
-    {
-      "start": "100m",
-      "end": "50m",
-      "name": "100→次周50"
-    },
-    {
-      "start": "AP1",
-      "end": "BP"
-    }
-  ],
-  "training2": [
-    {
-      "start": "SB1",
-      "end": "BP"
-    }
-  ],
-  "training3": [
-    {
-      "start": "FP_start",
-      "end": "60m"
-    },
-    {
-      "start": "0m_start",
-      "end": "50m"
-    }
-  ],
-  "training4":[]
+  "settings": {
+    "maxRows": 3,
+    "showAllColumns": false,
+    "disableFilter": false
+  },
+  "training1": {
+    "mainKPI": "50m-100m",
+    "intervals": [
+      {
+        "start": "50m",
+        "end": "100m"
+      },
+      {
+        "start": "100m",
+        "end": "50m",
+        "name": "100→次周50"
+      },
+      {
+        "start": "AP1",
+        "end": "BP"
+      }
+    ]
+  },
+  "training2": {
+    "mainKPI": "SB1-BP",
+    "intervals": [
+      {
+        "start": "SB1",
+        "end": "BP"
+      }
+    ]
+  },
+  "training3": {
+    "mainKPI": "FP_start-60m",
+    "intervals": [
+      {
+        "start": "FP_start",
+        "end": "60m"
+      },
+      {
+        "start": "0m_start",
+        "end": "50m"
+      }
+    ]
+  },
+  "training4": {
+    "mainKPI": null,
+    "intervals": []
+  }
 }

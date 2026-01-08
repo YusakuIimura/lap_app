@@ -498,7 +498,6 @@ class KPIJsonEditorPage(QWidget):
             try:
                 self.kpi_page._interval_config = self._config
                 self.kpi_page._ensure_interval_columns()
-                self.kpi_page._build_filters()
                 self.kpi_page._rebuild_table(self.kpi_page.debug_all_cols.isChecked())
             except Exception as e:
                 print(f"[ERROR] Failed to update KPI page after save: {e}")
@@ -527,7 +526,7 @@ class KPIPage(QWidget):
     """
     KPIページ
     - データ処理ロジック（DB 取得 / KPI 計算）は _load_data_and_prepare_kpi 系に集約
-    - UI 構築は _build_ui / _build_filters / _rebuild_table で担当
+    - UI 構築は _build_ui / _rebuild_table で担当
     """
 
     # ------------------------------------------------------------------
@@ -548,12 +547,6 @@ class KPIPage(QWidget):
             self._settings = _load_json(SETTINGS_PATH)
             self._interval_config: dict = {}
 
-            # フィルタ用
-            self.filter_kpi_combo: QComboBox | None = None
-            self.filter_min_edit: QLineEdit | None = None
-            self.filter_max_edit: QLineEdit | None = None
-            self._filter_stats: dict[str, tuple[float | None, float | None]] = {}
-            self._current_filter_col: str | None = None
 
             # time_mode 初期値
             try:
@@ -576,8 +569,7 @@ class KPIPage(QWidget):
             # UI 構築（UI ロジック）
             self._build_ui()
 
-            # フィルタ・テーブル初期化
-            self._build_filters()
+            # テーブル初期化
             self._rebuild_table(self.debug_all_cols.isChecked())
             
             self.track_image_path = self._settings.get("image_path", "")
@@ -614,6 +606,9 @@ class KPIPage(QWidget):
 
             # ラップタイム列から区間タイム列を追加
             self._ensure_interval_columns()
+            
+            # 元のデータを保持（フィルタリング前の全データ）
+            self.df_all_raw = self.df_all.copy()
         except Exception as e:
             print(f"[ERROR] _load_data_and_prepare_kpi() failed: {e}")
             import traceback
@@ -639,10 +634,20 @@ class KPIPage(QWidget):
             pos_index = {name: i for i, name in enumerate(TRACK_ORDER)}
 
             for mode, entries in cfg.items():
-                if not isinstance(entries, list):
+                # settingsキーとmainKPIキーはスキップ
+                if mode in ("settings", "mainKPI"):
+                    continue
+                
+                # 新しい構造: { "intervals": [...], "mainKPI": "..." }
+                # 既存の構造: [...]
+                if isinstance(entries, dict):
+                    interval_list = entries.get("intervals", [])
+                elif isinstance(entries, list):
+                    interval_list = entries
+                else:
                     continue
 
-                for ent in entries:
+                for ent in interval_list:
                     if not isinstance(ent, dict):
                         continue
                     
@@ -730,7 +735,16 @@ class KPIPage(QWidget):
         """
         mode = (self.time_mode or "rolling").lower()
         cfg = self._interval_config or {}
-        entries = cfg.get(mode, [])
+        mode_data = cfg.get(mode, [])
+        
+        # 新しい構造: { "intervals": [...], "mainKPI": "..." }
+        # 既存の構造: [...]
+        if isinstance(mode_data, dict):
+            entries = mode_data.get("intervals", [])
+        elif isinstance(mode_data, list):
+            entries = mode_data
+        else:
+            entries = []
 
         cols: list[str] = []
         for ent in entries:
@@ -746,6 +760,92 @@ class KPIPage(QWidget):
         # 実際に DataFrame に存在するものだけ
         return [c for c in cols if c in self.df_all.columns]
 
+    def _filter_by_main_kpi(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        現在のモードのmainKPIに基づいて、選手ごとにその値が小さい順にソートし、
+        各選手から上位5行を取得する。
+        """
+        try:
+            if df.empty or df is None:
+                return df
+
+            # 現在のモードのmainKPIを取得
+            mode = (self.time_mode or "rolling").lower()
+            cfg = self._interval_config or {}
+            mode_data = cfg.get(mode, [])
+            
+            # 新しい構造: { "intervals": [...], "mainKPI": "..." }
+            # 既存の構造: [...]
+            if isinstance(mode_data, dict):
+                main_kpi = mode_data.get("mainKPI")
+            else:
+                # 既存の構造ではmainKPIはグローバルに設定されている可能性がある
+                main_kpi = cfg.get("mainKPI")
+            
+            if not main_kpi:
+                # mainKPIが設定されていない場合は全データを返す
+                return df
+
+            # mainKPIの列が存在するか確認
+            if main_kpi not in df.columns:
+                print(f"[WARNING] mainKPI列 '{main_kpi}' が存在しません")
+                return df
+
+            # 選手を識別する列を決定（user_idがあればそれを使う、なければfirst_name+last_name）
+            player_id_cols = []
+            if "user_id" in df.columns:
+                player_id_cols = ["user_id"]
+            elif "first_name" in df.columns and "last_name" in df.columns:
+                player_id_cols = ["first_name", "last_name"]
+            else:
+                print("[WARNING] 選手を識別する列が見つかりません")
+                return df
+
+            # 選手ごとにグループ化して、mainKPIの値が小さい順にソート
+            # 各選手から上位5行を取得
+            filtered_rows = []
+            
+            for player_id, group in df.groupby(player_id_cols):
+                # mainKPIの値でソート（NaNは最後に）
+                group_sorted = group.sort_values(
+                    by=main_kpi,
+                    ascending=True,
+                    na_position='last'
+                )
+                
+                # NaNでない行を取得
+                valid_group = group_sorted[group_sorted[main_kpi].notna()]
+                # 設定から最大行数を取得
+                settings = self._interval_config.get("settings", {})
+                max_rows = settings.get("maxRows", 5)
+                
+                if len(valid_group) > 0:
+                    # 上位max_rows行を取得
+                    top_rows = valid_group.head(max_rows)
+                    filtered_rows.append(top_rows)
+                else:
+                    # すべてNaNの場合は最初のmax_rows行を残す（または全行）
+                    top_rows = group_sorted.head(max_rows)
+                    if len(top_rows) > 0:
+                        filtered_rows.append(top_rows)
+
+            if filtered_rows:
+                settings = self._interval_config.get("settings", {})
+                max_rows = settings.get("maxRows", 5)
+                result = pd.concat(filtered_rows, ignore_index=True)
+                print(f"[KPI] mainKPI '{main_kpi}' でフィルタリング: {len(result)} 行を表示（選手ごとに最大{max_rows}行）")
+                return result
+            else:
+                print("[WARNING] mainKPIでフィルタリング後、データが残りませんでした")
+                return df
+
+        except Exception as e:
+            print(f"[ERROR] _filter_by_main_kpi() failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # エラー時は元のデータを返す
+            return df
+
     # ------------------------------------------------------------------
     # UIロジック
     # ------------------------------------------------------------------
@@ -756,12 +856,8 @@ class KPIPage(QWidget):
         main_layout = QVBoxLayout()
         main_layout.addWidget(QLabel("KPIs"))
 
-        # --- 上部バー（Show All, モード切替, Reload） ---
+        # --- 上部バー（モード切替, Reload） ---
         top_row = QHBoxLayout()
-
-        self.debug_all_cols = QCheckBox("Show All Columns")
-        self.debug_all_cols.setChecked(False)
-        top_row.addWidget(self.debug_all_cols)
 
         # モード選択ドロップダウン（kpi.jsonのキーから動的に生成）
         mode_container = QWidget()
@@ -770,8 +866,8 @@ class KPIPage(QWidget):
         mode_layout.setContentsMargins(0, 0, 0, 0)
         mode_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        # kpi.jsonからキーを取得して選択肢を追加
-        mode_keys = list(self._interval_config.keys()) if self._interval_config else []
+        # kpi.jsonからキーを取得して選択肢を追加（settingsキーは除外）
+        mode_keys = [k for k in (self._interval_config.keys() if self._interval_config else []) if k != "settings"]
         if not mode_keys:
             # デフォルト値（kpi.jsonが空の場合）
             mode_keys = ["training1", "training2", "training3"]
@@ -801,6 +897,41 @@ class KPIPage(QWidget):
         self.addAction(reload_action)
 
         main_layout.addLayout(top_row)
+
+        # --- 設定行（Modeの下） ---
+        settings_row = QHBoxLayout()
+        
+        # kpi.jsonから設定を読み込む
+        settings = self._interval_config.get("settings", {})
+        max_rows = settings.get("maxRows", 5)
+        show_all_cols = settings.get("showAllColumns", False)
+        disable_filter = settings.get("disableFilter", False)
+
+        # Show All Columns
+        self.debug_all_cols = QCheckBox("Show All Columns")
+        self.debug_all_cols.setChecked(show_all_cols)
+        settings_row.addWidget(self.debug_all_cols)
+
+        # Disable Filter
+        self.disable_filter_check = QCheckBox("Disable Filter")
+        self.disable_filter_check.setChecked(disable_filter)
+        settings_row.addWidget(self.disable_filter_check)
+
+        # Max Rows
+        settings_row.addWidget(QLabel("Max Rows:"))
+        self.max_rows_combo = QComboBox()
+        for i in range(1, 21):  # 1から20まで
+            self.max_rows_combo.addItem(str(i), userData=i)
+        # 現在の値を選択
+        current_max_rows_index = self.max_rows_combo.findData(max_rows)
+        if current_max_rows_index >= 0:
+            self.max_rows_combo.setCurrentIndex(current_max_rows_index)
+        else:
+            self.max_rows_combo.setCurrentIndex(4)  # デフォルト5
+        settings_row.addWidget(self.max_rows_combo)
+        
+        settings_row.addStretch()
+        main_layout.addLayout(settings_row)
 
         # --- フィルタフォーム（1行だけ：KPI選択 + min/max） ---
         self.filter_form = QFormLayout()
@@ -843,101 +974,45 @@ class KPIPage(QWidget):
         self.setLayout(main_layout)
 
         # シグナル接続（UI→挙動）
-        self.debug_all_cols.stateChanged.connect(
-            lambda _s: self._rebuild_table(self.debug_all_cols.isChecked())
-        )
+        self.debug_all_cols.stateChanged.connect(self._on_show_all_cols_changed)
+        self.disable_filter_check.stateChanged.connect(self._on_disable_filter_changed)
+        self.max_rows_combo.currentIndexChanged.connect(self._on_max_rows_changed)
         self.mode_combo.currentIndexChanged.connect(
             lambda _i: self._on_mode_changed(self.mode_combo.currentData())
         )
 
-    # ---- フィルタ UI ----
-    def _build_filters(self):
-        try:
-            # 既存行をクリア
-            while self.filter_form.rowCount():
-                self.filter_form.removeRow(0)
-
-            self.filter_kpi_combo = None
-            self.filter_min_edit = None
-            self.filter_max_edit = None
-            self._filter_stats = {}
-            self._current_filter_col = None
-
-            numeric_cols = self._display_kpi_columns()
-            if not numeric_cols or self.df_all.empty or self.df_all is None:
-                label = QLabel("KPI Filter: 利用可能な数値KPIがありません")
-                self.filter_form.addRow(label)
-                return
-
-            # Q1, Q3 を計算
-            try:
-                num_df = self.df_all[numeric_cols].apply(pd.to_numeric, errors="coerce")
-                q1 = num_df.quantile(0.25, numeric_only=True)
-                q3 = num_df.quantile(0.75, numeric_only=True)
-                for col in numeric_cols:
-                    try:
-                        self._filter_stats[col] = (
-                            float(q1[col]) if pd.notna(q1[col]) else None,
-                            float(q3[col]) if pd.notna(q3[col]) else None,
-                        )
-                    except Exception:
-                        self._filter_stats[col] = (None, None)
-            except Exception as e:
-                print(f"[ERROR] Failed to calculate filter stats: {e}")
-                for col in numeric_cols:
-                    self._filter_stats[col] = (None, None)
-
-            row = QHBoxLayout()
-            combo = QComboBox()
-            combo.addItem("（No Filter）", userData=None)
-            for col in numeric_cols:
-                combo.addItem(col, userData=col)
-
-            min_edit = QLineEdit()
-            min_edit.setPlaceholderText("min（Fallback to first quartile if empty）")
-
-            max_edit = QLineEdit()
-            max_edit.setPlaceholderText("max（Fallback to third quartile if empty）")
-
-            row.addWidget(combo)
-            row.addWidget(min_edit)
-            row.addWidget(QLabel("〜"))
-            row.addWidget(max_edit)
-
-            self.filter_form.addRow("KPI Filter", row)
-
-            self.filter_kpi_combo = combo
-            self.filter_min_edit = min_edit
-            self.filter_max_edit = max_edit
-
-            combo.currentIndexChanged.connect(
-                lambda _i: self._on_filter_kpi_changed(combo.currentData())
-            )
-            min_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
-            max_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
-
-            # 初期状態（フィルタなし）
-            self._apply_filter_from_ui()
-        except Exception as e:
-            print(f"[ERROR] _build_filters() failed: {e}")
-            import traceback
-            traceback.print_exc()
 
     # ---- テーブル再構築 ----
     def _rebuild_table(self, show_all: bool):
         try:
-            if self.df_all is None or self.df_all.empty:
+            # 元のデータからフィルタリング
+            source_df = getattr(self, "df_all_raw", None)
+            if source_df is None or source_df.empty:
+                source_df = self.df_all
+            if source_df is None or source_df.empty:
                 self.model = DataFrameModel(pd.DataFrame())
-                self.proxy = RangeFilterProxy([])
-                self.proxy.setSourceModel(self.model)
-                self.table.setModel(self.proxy)
+                self.table.setModel(self.model)
                 return
 
-            if "__row_id" not in self.df_all.columns:
-                self.df_all = self.df_all.copy()
-                self.df_all["__row_id"] = range(len(self.df_all))
+            # mainKPIでフィルタリング（設定に応じて）
+            settings = self._interval_config.get("settings", {})
+            disable_filter = settings.get("disableFilter", False)
+            
+            if disable_filter:
+                df_filtered = source_df.copy()
+            else:
+                df_filtered = self._filter_by_main_kpi(source_df.copy())
+            
+            if df_filtered is None or df_filtered.empty:
+                self.model = DataFrameModel(pd.DataFrame())
+                self.table.setModel(self.model)
+                return
 
-            df_current = self.df_all.copy()
+            if "__row_id" not in df_filtered.columns:
+                df_filtered = df_filtered.copy()
+                df_filtered["__row_id"] = range(len(df_filtered))
+
+            df_current = df_filtered.copy()
 
             if show_all:
                 all_cols = [
@@ -974,18 +1049,16 @@ class KPIPage(QWidget):
             # 赤字用マスク
             mask_view = None
             flag_map = {c: f"imputed__{c}" for c in cols}
-            if any(fc in self.df_all.columns for fc in flag_map.values()):
+            if any(fc in df_filtered.columns for fc in flag_map.values()):
                 mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
                 for c, fc in flag_map.items():
-                    if fc in self.df_all.columns:
+                    if fc in df_filtered.columns:
                         mask_view[c] = (
-                            self.df_all[fc].astype(bool).reindex(df_view.index).values
+                            df_filtered[fc].astype(bool).reindex(df_view.index).values
                         )
 
             self.model = DataFrameModel(df_view, mask_view)
-            self.proxy = RangeFilterProxy(df_view.columns.tolist())
-            self.proxy.setSourceModel(self.model)
-            self.table.setModel(self.proxy)
+            self.table.setModel(self.model)
 
             # 見た目調整
             hh = self.table.horizontalHeader()
@@ -1000,11 +1073,6 @@ class KPIPage(QWidget):
 
             self.table.setSelectionBehavior(QTableView.SelectRows)
             self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-            # フィルタ再適用
-            if hasattr(self, "_current_filter_col"):
-                self.proxy.set_filter_column(self._current_filter_col)
-                self._apply_filter_from_ui()
         except Exception as e:
             print(f"[ERROR] _rebuild_table() failed: {e}")
             import traceback
@@ -1012,74 +1080,54 @@ class KPIPage(QWidget):
             # エラー時は空のテーブルを表示
             try:
                 self.model = DataFrameModel(pd.DataFrame())
-                self.proxy = RangeFilterProxy([])
-                self.proxy.setSourceModel(self.model)
-                self.table.setModel(self.proxy)
+                self.table.setModel(self.model)
             except Exception:
                 pass
 
-    # ---- フィルタ挙動 ----
-    def _on_filter_kpi_changed(self, col_name: str | None):
-        self._current_filter_col = col_name
-        self._apply_filter_from_ui()
+    # ---- 設定変更 ----
+    def _on_show_all_cols_changed(self):
+        """Show All Columnsの設定を変更し、kpi.jsonに保存"""
+        try:
+            checked = self.debug_all_cols.isChecked()
+            if "settings" not in self._interval_config:
+                self._interval_config["settings"] = {}
+            self._interval_config["settings"]["showAllColumns"] = checked
+            _save_json(KPI_INTERVALS_PATH, self._interval_config)
+            self._rebuild_table(checked)
+        except Exception as e:
+            print(f"[ERROR] _on_show_all_cols_changed() failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def _on_filter_value_changed(self):
-        self._apply_filter_from_ui()
+    def _on_disable_filter_changed(self):
+        """Disable Filterの設定を変更し、kpi.jsonに保存"""
+        try:
+            checked = self.disable_filter_check.isChecked()
+            if "settings" not in self._interval_config:
+                self._interval_config["settings"] = {}
+            self._interval_config["settings"]["disableFilter"] = checked
+            _save_json(KPI_INTERVALS_PATH, self._interval_config)
+            self._rebuild_table(self.debug_all_cols.isChecked())
+        except Exception as e:
+            print(f"[ERROR] _on_disable_filter_changed() failed: {e}")
+            import traceback
+            traceback.print_exc()
 
-    def _apply_filter_from_ui(self):
-        if not hasattr(self, "proxy"):
-            return
-
-        col = self._current_filter_col
-        if not col:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        if not self.filter_min_edit or not self.filter_max_edit:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        tmin = self.filter_min_edit.text().strip()
-        tmax = self.filter_max_edit.text().strip()
-        q1, q3 = self._filter_stats.get(col, (None, None))
-
-        # ★ここがポイント：
-        # 両方空欄で、Q1/Q3が計算できているときは
-        # 実際にテキストボックスへQ1〜Q3を入れて見えるようにする
-        if tmin == "" and tmax == "" and (q1 is not None or q3 is not None):
-            self.filter_min_edit.blockSignals(True)
-            self.filter_max_edit.blockSignals(True)
-            if q1 is not None:
-                self.filter_min_edit.setText(f"{q1:.3f}")
-                tmin = self.filter_min_edit.text().strip()
-            if q3 is not None:
-                self.filter_max_edit.setText(f"{q3:.3f}")
-                tmax = self.filter_max_edit.text().strip()
-            self.filter_min_edit.blockSignals(False)
-            self.filter_max_edit.blockSignals(False)
-
-        def parse_or_default(text: str, default: float | None):
-            if text == "":
-                return default
-            try:
-                return float(text)
-            except Exception:
-                return default
-
-        vmin = parse_or_default(tmin, q1)
-        vmax = parse_or_default(tmax, q3)
-
-        # Q1, Q3 どちらも取れない場合はフィルタ無し扱い
-        if vmin is None and vmax is None:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        self.proxy.set_filter_column(col)
-        self.proxy.set_range(vmin, vmax)
-
+    def _on_max_rows_changed(self):
+        """Max Rowsの設定を変更し、kpi.jsonに保存"""
+        try:
+            max_rows = self.max_rows_combo.currentData()
+            if max_rows is None:
+                return
+            if "settings" not in self._interval_config:
+                self._interval_config["settings"] = {}
+            self._interval_config["settings"]["maxRows"] = max_rows
+            _save_json(KPI_INTERVALS_PATH, self._interval_config)
+            self._rebuild_table(self.debug_all_cols.isChecked())
+        except Exception as e:
+            print(f"[ERROR] _on_max_rows_changed() failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ---- モード変更 ----
     def _on_mode_changed(self, mode: str | None):
@@ -1095,7 +1143,6 @@ class KPIPage(QWidget):
             except Exception as e:
                 print(f"[ERROR] Failed to save settings: {e}")
 
-            self._build_filters()
             self._rebuild_table(self.debug_all_cols.isChecked())
         except Exception as e:
             print(f"[ERROR] _on_mode_changed() failed: {e}")
@@ -1312,7 +1359,6 @@ class KPIPage(QWidget):
                 self.mode_combo.blockSignals(False)
 
             # フィルタはモードに合わせて作り直し
-            self._build_filters()
             self._rebuild_table(self.debug_all_cols.isChecked())
 
             # ソート復元
