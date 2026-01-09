@@ -1,8 +1,8 @@
 {
   "settings": {
     "maxRows": 3,
-    "showAllColumns": false,
-    "disableFilter": false
+    "showAllColumns": true,
+    "showAllData": false
   },
   "training1": {
     "mainKPI": "50m-100m",
@@ -14,7 +14,7 @@
       {
         "start": "100m",
         "end": "50m",
-        "name": "100→次周50"
+        "name": "100→50"
       },
       {
         "start": "AP1",

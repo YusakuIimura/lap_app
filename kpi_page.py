@@ -165,6 +165,30 @@ class DataFrameModel(QAbstractTableModel):
             print(f"[ERROR] DataFrameModel.headerData() failed: {e}")
             return None
 
+    def sort(self, column: int, order: Qt.SortOrder = Qt.AscendingOrder):
+        """列でソートする"""
+        try:
+            if column < 0 or column >= len(self._df.columns):
+                return
+            
+            col_name = self._df.columns[column]
+            ascending = (order == Qt.AscendingOrder)
+            
+            # DataFrameをソート
+            self._df = self._df.sort_values(by=col_name, ascending=ascending, na_position='last')
+            
+            # マスクも同じ順序で並び替え
+            if self._mask is not None:
+                self._mask = self._mask.reindex(self._df.index)
+            
+            # モデル全体を更新
+            self.layoutAboutToBeChanged.emit()
+            self.layoutChanged.emit()
+        except Exception as e:
+            print(f"[ERROR] DataFrameModel.sort() failed: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 class RangeFilterProxy(QSortFilterProxyModel):
     """
@@ -292,7 +316,7 @@ class KPIJsonEditorPage(QWidget):
     kpi.json をGUIで編集するページ。
 
     上: トラック図の画像
-    下: モード(rolling/standing/flying)ごとの start/end 区間の一覧と追加・削除UI
+    下: モードごとの start/end 区間の一覧と追加・削除UI
     """
 
     def __init__(self, kpi_page: "KPIPage"):
@@ -305,10 +329,8 @@ class KPIJsonEditorPage(QWidget):
             import copy
             self._config = copy.deepcopy(kpi_page._interval_config) or {}
             # kpi.jsonのキーを取得して、存在しないキーには空リストを設定
-            mode_keys = list(self._config.keys())
-            if not mode_keys:
-                # デフォルト値（kpi.jsonが空の場合）
-                mode_keys = ["training1", "training2", "training3"]
+            # kpi.jsonのキーを取得（settingsキーは除外）
+            mode_keys = [k for k in self._config.keys() if k != "settings"]
             for key in mode_keys:
                 self._config.setdefault(key, [])
 
@@ -357,11 +379,8 @@ class KPIJsonEditorPage(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        # kpi.jsonからキーを取得して選択肢を追加
-        mode_keys = list(self._config.keys()) if self._config else []
-        if not mode_keys:
-            # デフォルト値（kpi.jsonが空の場合）
-            mode_keys = ["training1", "training2", "training3"]
+        # kpi.jsonからキーを取得して選択肢を追加（settingsキーは除外）
+        mode_keys = [k for k in (self._config.keys() if self._config else []) if k != "settings"]
         for key in sorted(mode_keys):
             # キー名を表示名に変換（先頭大文字）
             display_name = key.capitalize()
@@ -426,7 +445,12 @@ class KPIJsonEditorPage(QWidget):
     # ------------------------------------------------------------------
     def _current_mode(self) -> str:
         data = self.mode_combo.currentData()
-        return data or "rolling"
+        if data:
+            return data
+        # フォールバック: ドロップダウンの最初の項目
+        if self.mode_combo.count() > 0:
+            return self.mode_combo.itemData(0) or ""
+        return ""
 
     def _refresh_mode_entries(self):
         mode = self._current_mode()
@@ -547,20 +571,27 @@ class KPIPage(QWidget):
             self._settings = _load_json(SETTINGS_PATH)
             self._interval_config: dict = {}
 
+            # kpi.jsonを先に読み込んで、利用可能なモードを確認
+            self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
+            available_modes = [k for k in self._interval_config.keys() if k != "settings"]
 
             # time_mode 初期値
             try:
-                ui_mode = (self._settings.get("ui", {}).get("time_mode") or "rolling").lower()
-                if ui_mode in ("rs", "rolling"):
-                    self.time_mode = "rolling"
-                elif ui_mode in ("standing",):
-                    self.time_mode = "standing"
-                elif ui_mode in ("fly", "flying"):
-                    self.time_mode = "flying"
+                ui_mode = (self._settings.get("ui", {}).get("time_mode") or "").lower()
+                # 設定されたモードが利用可能な場合はそれを使用
+                if ui_mode and ui_mode in available_modes:
+                    self.time_mode = ui_mode
+                elif available_modes:
+                    # 利用可能な最初のモードを使用
+                    self.time_mode = available_modes[0]
                 else:
-                    self.time_mode = "rolling"
+                    # モードが存在しない場合は空文字列
+                    self.time_mode = ""
             except Exception:
-                self.time_mode = "rolling"
+                if available_modes:
+                    self.time_mode = available_modes[0]
+                else:
+                    self.time_mode = ""
 
             # データ読み込み + KPI 準備（Data ロジック）
             self.df_all = pd.DataFrame()
@@ -581,7 +612,7 @@ class KPIPage(QWidget):
             self.df_all = pd.DataFrame()
             self._interval_config = {}
             self._settings = {}
-            self.time_mode = "rolling"
+            self.time_mode = ""
             self.track_image_path = ""
             raise
  
@@ -601,8 +632,9 @@ class KPIPage(QWidget):
 
             self.df_all = df_any
 
-            # kpi.json から interval 定義を読み込み
-            self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
+            # kpi.json から interval 定義を読み込み（既に初期化時に読み込まれている場合はスキップ）
+            if not self._interval_config:
+                self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
 
             # ラップタイム列から区間タイム列を追加
             self._ensure_interval_columns()
@@ -733,7 +765,7 @@ class KPIPage(QWidget):
         - name があれば name
         - なければ "start-end"
         """
-        mode = (self.time_mode or "rolling").lower()
+        mode = (self.time_mode or "").lower()
         cfg = self._interval_config or {}
         mode_data = cfg.get(mode, [])
         
@@ -770,7 +802,7 @@ class KPIPage(QWidget):
                 return df
 
             # 現在のモードのmainKPIを取得
-            mode = (self.time_mode or "rolling").lower()
+            mode = (self.time_mode or "").lower()
             cfg = self._interval_config or {}
             mode_data = cfg.get(mode, [])
             
@@ -867,10 +899,8 @@ class KPIPage(QWidget):
         mode_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         # kpi.jsonからキーを取得して選択肢を追加（settingsキーは除外）
+        # kpi.jsonからキーを取得（settingsキーは除外）
         mode_keys = [k for k in (self._interval_config.keys() if self._interval_config else []) if k != "settings"]
-        if not mode_keys:
-            # デフォルト値（kpi.jsonが空の場合）
-            mode_keys = ["training1", "training2", "training3"]
         for key in sorted(mode_keys):
             # キー名を表示名に変換（先頭大文字）
             display_name = key.capitalize()
@@ -905,7 +935,7 @@ class KPIPage(QWidget):
         settings = self._interval_config.get("settings", {})
         max_rows = settings.get("maxRows", 5)
         show_all_cols = settings.get("showAllColumns", False)
-        disable_filter = settings.get("disableFilter", False)
+        disable_filter = settings.get("showAllData", False)
 
         # Show All Columns
         self.debug_all_cols = QCheckBox("Show All Columns")
@@ -913,7 +943,7 @@ class KPIPage(QWidget):
         settings_row.addWidget(self.debug_all_cols)
 
         # Disable Filter
-        self.disable_filter_check = QCheckBox("Disable Filter")
+        self.disable_filter_check = QCheckBox("Show All Data")
         self.disable_filter_check.setChecked(disable_filter)
         settings_row.addWidget(self.disable_filter_check)
 
@@ -996,7 +1026,7 @@ class KPIPage(QWidget):
 
             # mainKPIでフィルタリング（設定に応じて）
             settings = self._interval_config.get("settings", {})
-            disable_filter = settings.get("disableFilter", False)
+            disable_filter = settings.get("showAllData", False)
             
             if disable_filter:
                 df_filtered = source_df.copy()
@@ -1105,7 +1135,7 @@ class KPIPage(QWidget):
             checked = self.disable_filter_check.isChecked()
             if "settings" not in self._interval_config:
                 self._interval_config["settings"] = {}
-            self._interval_config["settings"]["disableFilter"] = checked
+            self._interval_config["settings"]["showAllData"] = checked
             _save_json(KPI_INTERVALS_PATH, self._interval_config)
             self._rebuild_table(self.debug_all_cols.isChecked())
         except Exception as e:
@@ -1179,7 +1209,7 @@ class KPIPage(QWidget):
             ) != QMessageBox.Yes:
                 return
 
-            source_rows = sorted({self.proxy.mapToSource(i).row() for i in sel if self.proxy.mapToSource(i).isValid()})
+            source_rows = sorted({i.row() for i in sel if i.isValid()})
 
             if not source_rows:
                 return
@@ -1214,22 +1244,12 @@ class KPIPage(QWidget):
             if not path:
                 return
 
-            rows = []
-            for r in range(self.proxy.rowCount()):
-                try:
-                    idx = self.proxy.index(r, 0)
-                    if idx.isValid():
-                        source_idx = self.proxy.mapToSource(idx)
-                        if source_idx.isValid():
-                            rows.append(source_idx.row())
-                except Exception:
-                    continue
-
-            if not rows:
-                QMessageBox.warning(self, "Export Failed", "エクスポートする行がありません")
+            if not hasattr(self, "model") or not self.model:
+                QMessageBox.warning(self, "Export Failed", "データがありません")
                 return
 
-            export_df = self.df_all.iloc[rows].copy()
+            # モデルから直接DataFrameを取得
+            export_df = self.model._df.copy()
 
             drop_cols = [
                 c for c in export_df.columns if c.startswith("imputed__")
@@ -1333,7 +1353,7 @@ class KPIPage(QWidget):
                 pass
 
             # 現在のモードを覚えておく
-            current_mode = getattr(self, "time_mode", "rolling")
+            current_mode = getattr(self, "time_mode", "")
 
             # データを再読込
             self._load_data_and_prepare_kpi()
@@ -1342,9 +1362,8 @@ class KPIPage(QWidget):
             if hasattr(self, "mode_combo"):
                 self.mode_combo.blockSignals(True)
                 self.mode_combo.clear()
-                mode_keys = list(self._interval_config.keys()) if self._interval_config else []
-                if not mode_keys:
-                    mode_keys = ["training1", "training2", "training3"]
+                # kpi.jsonからキーを取得（settingsキーは除外）
+                mode_keys = [k for k in (self._interval_config.keys() if self._interval_config else []) if k != "settings"]
                 for key in sorted(mode_keys):
                     display_name = key.capitalize()
                     self.mode_combo.addItem(display_name, userData=key)
@@ -1379,7 +1398,7 @@ class KPIPage(QWidget):
         print("[KPI] kpi.json リロード開始")
 
         # 現在のモードを覚えておく
-        current_mode = getattr(self, "time_mode", "training1")
+        current_mode = getattr(self, "time_mode", "")
 
         # kpi.json を読み直し
         self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
@@ -1388,9 +1407,8 @@ class KPIPage(QWidget):
         if hasattr(self, "mode_combo"):
             self.mode_combo.blockSignals(True)
             self.mode_combo.clear()
-            mode_keys = list(self._interval_config.keys()) if self._interval_config else []
-            if not mode_keys:
-                mode_keys = ["training1", "training2", "training3"]
+            # kpi.jsonからキーを取得（settingsキーは除外）
+            mode_keys = [k for k in (self._interval_config.keys() if self._interval_config else []) if k != "settings"]
             for key in sorted(mode_keys):
                 display_name = key.capitalize()
                 self.mode_combo.addItem(display_name, userData=key)
