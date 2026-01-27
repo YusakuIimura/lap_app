@@ -510,17 +510,25 @@ class KPIPage(QWidget):
                 idx_e = pos_index.get(end)
 
                 if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                    # start の方が“後” → end は次周の値を使う
+                    # start の方が"後" → end は次周の値を使う
                     e_series = e.shift(-1)
                 else:
                     # 通常: 同一周回内
                     e_series = e
 
-                diff = e_series - s
+                # None や NaN を含む行は NaN として処理
+                mask_valid = pd.notna(s) & pd.notna(e_series)
+                diff = pd.Series(index=s.index, dtype='timedelta64[ns]')
+                diff[mask_valid] = e_series[mask_valid] - s[mask_valid]
+                diff[~mask_valid] = pd.NaT
 
                 # datetime → Timedelta → 秒
                 try:
-                    self.df_all[col_name] = diff.dt.total_seconds().round(3)
+                    result = pd.Series(index=diff.index, dtype=float)
+                    valid_mask = pd.notna(diff)
+                    result[valid_mask] = diff[valid_mask].dt.total_seconds().round(3)
+                    result[~valid_mask] = math.nan
+                    self.df_all[col_name] = result
                 except Exception:
                     # 念のためのフォールバック
                     def _calc(row):
