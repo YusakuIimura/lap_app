@@ -245,12 +245,56 @@ def split_laps(df, all_data=None, log_file=None):
     logger.info(f"データ処理開始: {len(df)}行")
     logger.info(f"期待される順序: {expected_order}")
     
+    def complete_lap(lap_dict, lap_num):
+        """ラップを完成させてrowsに追加する"""
+        # SB1を検索（0mから5秒前まで）
+        sb1_value = None
+        if sb1_candidates is not None and "0m" in lap_dict and lap_dict["0m"] is not None:
+            zero_m_time = lap_dict["0m"]
+            time_window_start = zero_m_time - timedelta(seconds=5)
+            time_window_end = zero_m_time
+            
+            # 0mから5秒前までの範囲でSB1を検索
+            sb1_in_range = sb1_candidates[
+                (sb1_candidates["timestamp"] >= time_window_start) &
+                (sb1_candidates["timestamp"] <= time_window_end)
+            ]
+            
+            if len(sb1_in_range) > 0:
+                # 最も近いSB1を採用（0mに最も近いもの）
+                sb1_in_range = sb1_in_range.sort_values("timestamp", ascending=False)
+                sb1_value = sb1_in_range.iloc[0]["timestamp"]
+                logger.info(f"ラップ {lap_num}: SB1を検出 {sb1_value} (0m: {zero_m_time})")
+        
+        # SB1を追加
+        lap_dict["SB1"] = sb1_value
+        
+        # セットを追加
+        rows.append(lap_dict.copy())
+        logger.info(f"ラップ {lap_num} 完了: {lap_dict}")
+    
     for idx, row in df.iterrows():
         pos = row["position"]
         ts = row["timestamp"]
         
         # 期待される順序の位置を確認
         if pos in expected_order:
+            # 既にラップが完成している場合（expected_idx >= len(expected_order)）
+            if expected_idx >= len(expected_order):
+                # 前のラップが不完全な場合の処理（FPが抜けている）
+                if current_lap:
+                    # FPが抜けている：FPを空欄にして完成
+                    current_lap["FP"] = None
+                    logger.info(f"FPが抜けているため空欄に設定してラップを完成")
+                    complete_lap(current_lap, len(rows) + 1)
+                    current_lap = {}
+                
+                # 新しいラップを開始
+                if pos == expected_order[0]:  # 0mから開始
+                    current_lap[pos] = ts
+                    expected_idx = 1
+                continue
+            
             expected_pos = expected_order[expected_idx]
             
             if pos == expected_pos:
@@ -260,53 +304,111 @@ def split_laps(df, all_data=None, log_file=None):
                 
                 # 1セット完了（FPまで到達）
                 if expected_idx >= len(expected_order):
-                    # SB1を検索（0mから5秒前まで）
-                    sb1_value = None
-                    if sb1_candidates is not None and "0m" in current_lap:
-                        zero_m_time = current_lap["0m"]
-                        time_window_start = zero_m_time - timedelta(seconds=5)
-                        time_window_end = zero_m_time
-                        
-                        # 0mから5秒前までの範囲でSB1を検索
-                        sb1_in_range = sb1_candidates[
-                            (sb1_candidates["timestamp"] >= time_window_start) &
-                            (sb1_candidates["timestamp"] <= time_window_end)
-                        ]
-                        
-                        if len(sb1_in_range) > 0:
-                            # 最も近いSB1を採用（0mに最も近いもの）
-                            sb1_in_range = sb1_in_range.sort_values("timestamp", ascending=False)
-                            sb1_value = sb1_in_range.iloc[0]["timestamp"]
-                            logger.info(f"ラップ {len(rows) + 1}: SB1を検出 {sb1_value} (0m: {zero_m_time})")
-                    
-                    # SB1を追加
-                    current_lap["SB1"] = sb1_value
-                    
-                    # 完全にそろっているセットを追加
-                    rows.append(current_lap.copy())
-                    logger.info(f"ラップ {len(rows)} 完了: {current_lap}")
+                    complete_lap(current_lap, len(rows) + 1)
                     current_lap = {}
                     expected_idx = 0
             else:
-                # 順序が合わない場合は現在のセットをリセット
-                if current_lap:
-                    logger.warning(f"順序不一致でラップ破棄: 期待={expected_pos}, 実際={pos}, 現在のセット={current_lap}")
-                current_lap = {}
-                expected_idx = 0
+                # 順序が合わない場合、何個抜けているかチェック
+                # 循環を考慮：FPの後は0mが来る
+                found_match = False
                 
-                # 新しいセットを開始
-                if pos == expected_order[0]:  # 0mから開始
+                # 200mまで到達した後、次のデータが0m（新しいラップの開始）の場合、FPが抜けている
+                if expected_idx == len(expected_order) - 1 and pos == expected_order[0]:
+                    # FPが抜けている：FPを空欄にしてラップを完成
+                    current_lap["FP"] = None
+                    logger.info(f"FPが抜けているため空欄に設定してラップを完成")
+                    complete_lap(current_lap, len(rows) + 1)
+                    current_lap = {}
+                    
+                    # 新しいラップを開始
                     current_lap[pos] = ts
                     expected_idx = 1
+                    found_match = True
+                else:
+                    # 1つ先、2つ先...とチェック（最大2つまで）
+                    # 循環を考慮：FPの後は0mが来るので、check_idxが範囲外の場合は0mをチェック
+                    for skip_count in range(1, min(3, len(expected_order) - expected_idx + 2)):
+                        check_idx = expected_idx + skip_count
+                        
+                        # 循環を考慮：範囲外の場合は0m（expected_order[0]）をチェック
+                        if check_idx < len(expected_order):
+                            check_pos = expected_order[check_idx]
+                        elif check_idx == len(expected_order) and pos == expected_order[0]:
+                            # FPの後は0mが来る（循環）
+                            check_pos = expected_order[0]
+                        else:
+                            continue
+                        
+                        if pos == check_pos:
+                            # skip_count個抜けている
+                            if check_idx < len(expected_order):
+                                missing_positions = [expected_order[i] for i in range(expected_idx, check_idx)]
+                            else:
+                                # FPが抜けている場合
+                                missing_positions = [expected_order[expected_idx]]
+                            
+                            if skip_count == 1:
+                                # 1つだけ抜けている：空欄にして続行
+                                current_lap[missing_positions[0]] = None
+                                logger.info(f"位置 {missing_positions[0]} が抜けているため空欄に設定。次の位置 {pos} を記録")
+                                current_lap[pos] = ts
+                                
+                                if check_idx < len(expected_order):
+                                    expected_idx = check_idx + 1
+                                else:
+                                    # FPの後は0m（循環）
+                                    expected_idx = 1
+                                
+                                # 1セット完了（FPまで到達）
+                                if expected_idx >= len(expected_order):
+                                    complete_lap(current_lap, len(rows) + 1)
+                                    current_lap = {}
+                                    expected_idx = 0
+                                found_match = True
+                                break
+                            else:
+                                # 2つ以上抜けている：ラップを廃棄
+                                logger.warning(f"不完全なラップを破棄（{skip_count}個の位置が抜けている: {missing_positions}）: {current_lap}")
+                                current_lap = {}
+                                expected_idx = 0
+                                
+                                # 新しいセットを開始
+                                if pos == expected_order[0]:  # 0mから開始
+                                    current_lap[pos] = ts
+                                    expected_idx = 1
+                                found_match = True
+                                break
+                
+                if not found_match:
+                    # どの期待位置とも一致しない場合、ラップを廃棄
+                    if current_lap:
+                        logger.warning(f"順序不一致でラップ破棄: 期待={expected_pos}, 実際={pos}, 現在のセット={current_lap}")
+                    current_lap = {}
+                    expected_idx = 0
+                    
+                    # 新しいセットを開始
+                    if pos == expected_order[0]:  # 0mから開始
+                        current_lap[pos] = ts
+                        expected_idx = 1
     
-    # 最後のセットが不完全な場合は破棄（完全なセットのみ使用）
+    # 最後のセットが不完全な場合、1つだけ抜けている場合は完成させる
     if current_lap and expected_idx < len(expected_order):
-        logger.warning(f"不完全なラップを破棄: {current_lap}")
+        missing_count = len(expected_order) - expected_idx
+        if missing_count == 1:
+            # 1つだけ抜けている場合、最後の位置を空欄にして完成
+            last_expected_pos = expected_order[expected_idx]
+            current_lap[last_expected_pos] = None
+            logger.info(f"最後の位置 {last_expected_pos} が抜けているため空欄に設定してラップを完成")
+            complete_lap(current_lap, len(rows) + 1)
+        else:
+            # 2つ以上抜けている場合は破棄
+            missing_positions = [expected_order[i] for i in range(expected_idx, len(expected_order))]
+            logger.warning(f"不完全なラップを破棄（{missing_count}個の位置が抜けている: {missing_positions}）: {current_lap}")
     
-    logger.info(f"処理完了: {len(rows)}個の完全なラップを取得")
+    logger.info(f"処理完了: {len(rows)}個のラップを取得（一部空欄を含む可能性あり）")
     
     if not rows:
-        logger.warning("完全なラップが0件でした")
+        logger.warning("ラップが0件でした")
         columns_with_sb1 = ["SB1"] + expected_order
         return pd.DataFrame(columns=columns_with_sb1)
     
@@ -314,10 +416,17 @@ def split_laps(df, all_data=None, log_file=None):
     columns_with_sb1 = ["SB1"] + expected_order
     result_df = pd.DataFrame(rows, columns=columns_with_sb1)
     
-    # Date列を追加（最初のタイムスタンプの日付）
+    # Date列を追加（最初のタイムスタンプの日付、0mがNoneの場合は最初の有効なタイムスタンプを使用）
     if len(expected_order) > 0 and expected_order[0] in result_df.columns:
         first_col = expected_order[0]
-        result_df.insert(0, "Date", pd.to_datetime(result_df[first_col]).dt.date)
+        # 0mがNoneの場合は、最初の有効なタイムスタンプを探す
+        def get_date(row):
+            # 0mから順に有効なタイムスタンプを探す
+            for col in expected_order:
+                if col in row and pd.notna(row[col]) and row[col] is not None:
+                    return pd.to_datetime(row[col]).date()
+            return None
+        result_df.insert(0, "Date", result_df.apply(get_date, axis=1))
     
     # SB1列を0mの左に移動（Date列の後、0mの前）
     if "SB1" in result_df.columns and expected_order[0] in result_df.columns:
