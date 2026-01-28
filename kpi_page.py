@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import json
 import os
+import re
 
 from utils import fetch_df_from_db
 
@@ -482,38 +483,71 @@ class KPIPage(QWidget):
         cfg = self._interval_config or {}
         pos_index = {name: i for i, name in enumerate(TRACK_ORDER)}
 
+        def parse_position_with_offset(pos_str):
+            """
+            地点名から列名とオフセットを抽出
+            例: "0m+1" -> ("0m", 1), "200m+2" -> ("200m", 2), "0m" -> ("0m", 0)
+            """
+            if not pos_str:
+                return None, 0
+            
+            # +1, +2などのオフセットを抽出
+            match = re.match(r'^(.+?)(\+(\d+))?$', pos_str)
+            if match:
+                col_name = match.group(1)
+                offset_str = match.group(3)
+                offset = int(offset_str) if offset_str else 0
+                return col_name, offset
+            return pos_str, 0
+
         for mode, entries in cfg.items():
             if not isinstance(entries, list):
                 continue
 
             for ent in entries:
-                start = ent.get("start")
-                end = ent.get("end")
-                if not start or not end:
+                start_str = ent.get("start")
+                end_str = ent.get("end")
+                if not start_str or not end_str:
                     continue
 
-                col_name = ent.get("name") or f"{start}-{end}"
+                # 地点名とオフセットを解析
+                start_col, start_offset = parse_position_with_offset(start_str)
+                end_col, end_offset = parse_position_with_offset(end_str)
+
+                col_name = ent.get("name") or f"{start_str}-{end_str}"
 
                 # すでに列があるなら再計算しない
                 if col_name in self.df_all.columns:
                     continue
 
                 # 必要な地点タイムが無ければスキップ
-                if start not in self.df_all.columns or end not in self.df_all.columns:
+                if start_col not in self.df_all.columns or end_col not in self.df_all.columns:
                     continue
 
-                s = self.df_all[start]
-                e = self.df_all[end]
+                # オフセットを考慮してSeriesを取得
+                s = self.df_all[start_col]
+                if start_offset > 0:
+                    s = s.shift(-start_offset)
+                
+                e = self.df_all[end_col]
+                if end_offset > 0:
+                    e = e.shift(-end_offset)
 
                 # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
-                idx_s = pos_index.get(start)
-                idx_e = pos_index.get(end)
+                # オフセットを考慮した向き判定（オフセットがある場合は次周なので向き判定は不要）
+                idx_s = pos_index.get(start_col)
+                idx_e = pos_index.get(end_col)
 
-                if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                    # start の方が"後" → end は次周の値を使う
-                    e_series = e.shift(-1)
+                # オフセットがない場合のみ、従来の向き判定を使用
+                if start_offset == 0 and end_offset == 0:
+                    if idx_s is not None and idx_e is not None and idx_s > idx_e:
+                        # start の方が"後" → end は次周の値を使う
+                        e_series = e.shift(-1)
+                    else:
+                        # 通常: 同一周回内
+                        e_series = e
                 else:
-                    # 通常: 同一周回内
+                    # オフセットが指定されている場合はそのまま使用
                     e_series = e
 
                 # None や NaN を含む行は NaN として処理
@@ -531,13 +565,17 @@ class KPIPage(QWidget):
                     self.df_all[col_name] = result
                 except Exception:
                     # 念のためのフォールバック
-                    def _calc(row):
-                        t0 = row.get(start)
-                        t1 = row.get(end)
-                        if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                            # 次周の end
-                            # row 単位では next row を取れないので NaN 扱い
-                            return math.nan
+                    def _calc(row_idx):
+                        row = self.df_all.iloc[row_idx]
+                        # オフセットを考慮して値を取得
+                        t0 = row.get(start_col) if start_offset == 0 else None
+                        if start_offset > 0 and row_idx + start_offset < len(self.df_all):
+                            t0 = self.df_all.iloc[row_idx + start_offset].get(start_col)
+                        
+                        t1 = row.get(end_col) if end_offset == 0 else None
+                        if end_offset > 0 and row_idx + end_offset < len(self.df_all):
+                            t1 = self.df_all.iloc[row_idx + end_offset].get(end_col)
+                        
                         if pd.isna(t0) or pd.isna(t1):
                             return math.nan
                         try:
@@ -545,7 +583,10 @@ class KPIPage(QWidget):
                         except Exception:
                             return math.nan
 
-                    self.df_all[col_name] = self.df_all.apply(_calc, axis=1)
+                    self.df_all[col_name] = pd.Series(
+                        [_calc(i) for i in range(len(self.df_all))],
+                        index=self.df_all.index
+                    )
 
 
     def _display_kpi_columns(self) -> list[str]:

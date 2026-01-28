@@ -1,17 +1,24 @@
 {
   "rolling": [
     {
-      "start": "50m",
-      "end": "100m"
+      "start": "0m",
+      "end":"0m+1",
+      "name":"0m-next0m"
+    },
+    {
+      "start": "0m",
+      "end":"0m+4",
+      "name":"0m-0m+4"
+    },
+    {
+      "start": "100m",
+      "end": "50m+1",
+      "name": "100→50+1"
     },
     {
       "start": "100m",
       "end": "50m",
-      "name": "100→次周50"
-    },
-    {
-      "start": "AP1",
-      "end": "BP"
+      "name": "100→next50"
     }
   ],
   "standing": [
