@@ -217,9 +217,23 @@ class KPIJsonEditorPage(QWidget):
             self._config.setdefault(key, [])
 
         # start/end で選べる地点（df_all にある列だけを採用）
-        self.available_points = [
-            p for p in TRACK_ORDER if p in kpi_page.df_all.columns
-        ]
+        # TRACK_ORDERの列名を実際のデータフレームの列名にマッピング
+        # 0m_start -> 0m, FP_start -> FP など
+        track_order_mapping = {
+            "FP_start": "FP",
+            "0m_start": "0m",
+            "FP_2nd": "FP",
+            "0m_2nd": "0m",
+        }
+        
+        self.available_points = []
+        for p in TRACK_ORDER:
+            # マッピングがあればそれを使用、なければそのまま
+            actual_col = track_order_mapping.get(p, p)
+            if actual_col in kpi_page.df_all.columns:
+                # 重複を避ける
+                if actual_col not in self.available_points:
+                    self.available_points.append(actual_col)
 
         self._build_ui()
         self._refresh_mode_entries()
@@ -272,6 +286,12 @@ class KPIJsonEditorPage(QWidget):
         self.start_combo.addItems(self.available_points)
         self.end_combo = QComboBox()
         self.end_combo.addItems(self.available_points)
+        
+        # endのオフセット用ドロップダウン（次の周回、次の次の周回など）
+        self.end_offset_combo = QComboBox()
+        for i in range(11):  # 0から10まで
+            self.end_offset_combo.addItem(str(i), userData=i)
+        
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Display Name（start-end if empty）")
 
@@ -279,6 +299,8 @@ class KPIJsonEditorPage(QWidget):
         add_row.addWidget(self.start_combo)
         add_row.addWidget(QLabel("end:"))
         add_row.addWidget(self.end_combo)
+        add_row.addWidget(QLabel("end offset:"))
+        add_row.addWidget(self.end_offset_combo)
         add_row.addWidget(QLabel("Display Name:"))
         add_row.addWidget(self.name_edit)
 
@@ -287,6 +309,12 @@ class KPIJsonEditorPage(QWidget):
         add_row.addWidget(self.btnAdd)
 
         main.addLayout(add_row)
+        
+        # Usage comment
+        comment_label = QLabel("Note: end offset specifies which lap to use. Example: end=0m, offset=1 → next lap's 0m")
+        comment_label.setWordWrap(True)
+        comment_label.setStyleSheet("color: gray; font-size: 10pt;")
+        main.addWidget(comment_label)
 
         # 操作用ボタン
         btn_row = QHBoxLayout()
@@ -336,12 +364,19 @@ class KPIJsonEditorPage(QWidget):
     def _on_add_clicked(self):
         mode = self._current_mode()
         start = self.start_combo.currentText()
-        end = self.end_combo.currentText()
+        end_base = self.end_combo.currentText()
+        end_offset = self.end_offset_combo.currentData()
         name = self.name_edit.text().strip()
 
-        if not start or not end:
+        if not start or not end_base:
             QMessageBox.warning(self, "Cannot add.", "Please select both start and end.")
             return
+
+        # endにオフセットを追加（+0の場合は省略）
+        if end_offset and end_offset > 0:
+            end = f"{end_base}+{end_offset}"
+        else:
+            end = end_base
 
         entry = {"start": start, "end": end}
         if name:
@@ -349,6 +384,7 @@ class KPIJsonEditorPage(QWidget):
 
         self._config.setdefault(mode, []).append(entry)
         self.name_edit.clear()
+        self.end_offset_combo.setCurrentIndex(0)  # オフセットをリセット
         self._refresh_mode_entries()
 
     def _on_delete_clicked(self):

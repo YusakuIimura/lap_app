@@ -2,13 +2,13 @@
   "rolling": [
     {
       "start": "0m",
-      "end":"0m+1",
-      "name":"0m-next0m"
+      "end": "0m+1",
+      "name": "0m-next0m"
     },
     {
       "start": "0m",
-      "end":"0m+4",
-      "name":"0m-0m+4"
+      "end": "0m+4",
+      "name": "0m-0m+4"
     },
     {
       "start": "100m",
@@ -19,6 +19,14 @@
       "start": "100m",
       "end": "50m",
       "name": "100→next50"
+    },
+    {
+      "start": "60m",
+      "end": "60m+2"
+    },
+    {
+      "start": "FP",
+      "end": "FP+10"
     }
   ],
   "standing": [
