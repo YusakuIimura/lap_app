@@ -560,69 +560,158 @@ class KPIPage(QWidget):
                 if start_col not in self.df_all.columns or end_col not in self.df_all.columns:
                     continue
 
-                # オフセットを考慮してSeriesを取得
-                s = self.df_all[start_col]
-                if start_offset > 0:
-                    s = s.shift(-start_offset)
+                # 選手ごとにグループ化してKPIを計算
+                # user_idが存在する場合はグループ化、存在しない場合は全体を1つのグループとして扱う
+                group_key = "user_id" if "user_id" in self.df_all.columns else None
                 
-                e = self.df_all[end_col]
-                if end_offset > 0:
-                    e = e.shift(-end_offset)
-
-                # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
-                # オフセットを考慮した向き判定（オフセットがある場合は次周なので向き判定は不要）
-                idx_s = pos_index.get(start_col)
-                idx_e = pos_index.get(end_col)
-
-                # オフセットがない場合のみ、従来の向き判定を使用
-                if start_offset == 0 and end_offset == 0:
-                    if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                        # start の方が"後" → end は次周の値を使う
-                        e_series = e.shift(-1)
-                    else:
-                        # 通常: 同一周回内
-                        e_series = e
-                else:
-                    # オフセットが指定されている場合はそのまま使用
-                    e_series = e
-
-                # None や NaN を含む行は NaN として処理
-                mask_valid = pd.notna(s) & pd.notna(e_series)
-                diff = pd.Series(index=s.index, dtype='timedelta64[ns]')
-                diff[mask_valid] = e_series[mask_valid] - s[mask_valid]
-                diff[~mask_valid] = pd.NaT
-
-                # datetime → Timedelta → 秒
-                try:
-                    result = pd.Series(index=diff.index, dtype=float)
-                    valid_mask = pd.notna(diff)
-                    result[valid_mask] = diff[valid_mask].dt.total_seconds().round(3)
-                    result[~valid_mask] = math.nan
-                    self.df_all[col_name] = result
-                except Exception:
-                    # 念のためのフォールバック
-                    def _calc(row_idx):
-                        row = self.df_all.iloc[row_idx]
-                        # オフセットを考慮して値を取得
-                        t0 = row.get(start_col) if start_offset == 0 else None
-                        if start_offset > 0 and row_idx + start_offset < len(self.df_all):
-                            t0 = self.df_all.iloc[row_idx + start_offset].get(start_col)
+                if group_key:
+                    # 選手ごとにグループ化
+                    result_series = pd.Series(index=self.df_all.index, dtype=float)
+                    
+                    for user_id, group in self.df_all.groupby(group_key):
+                        group_indices = group.index
                         
-                        t1 = row.get(end_col) if end_offset == 0 else None
-                        if end_offset > 0 and row_idx + end_offset < len(self.df_all):
-                            t1 = self.df_all.iloc[row_idx + end_offset].get(end_col)
+                        # グループ内でのオフセットを考慮してSeriesを取得
+                        s_group = group[start_col].copy()
+                        if start_offset > 0:
+                            s_group = s_group.shift(-start_offset)
                         
-                        if pd.isna(t0) or pd.isna(t1):
-                            return math.nan
+                        e_group = group[end_col].copy()
+                        if end_offset > 0:
+                            e_group = e_group.shift(-end_offset)
+
+                        # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
+                        idx_s = pos_index.get(start_col)
+                        idx_e = pos_index.get(end_col)
+
+                        # オフセットがない場合のみ、従来の向き判定を使用
+                        if start_offset == 0 and end_offset == 0:
+                            if idx_s is not None and idx_e is not None and idx_s > idx_e:
+                                # start の方が"後" → end は次周の値を使う
+                                e_series_group = e_group.shift(-1)
+                            else:
+                                # 通常: 同一周回内
+                                e_series_group = e_group
+                        else:
+                            # オフセットが指定されている場合はそのまま使用
+                            e_series_group = e_group
+
+                        # None や NaN を含む行は NaN として処理
+                        mask_valid = pd.notna(s_group) & pd.notna(e_series_group)
+                        diff_group = pd.Series(index=group_indices, dtype='timedelta64[ns]')
+                        diff_group[mask_valid] = e_series_group[mask_valid] - s_group[mask_valid]
+                        diff_group[~mask_valid] = pd.NaT
+
+                        # datetime → Timedelta → 秒
                         try:
-                            return float((t1 - t0).total_seconds())
+                            result_group = pd.Series(index=group_indices, dtype=float)
+                            valid_mask = pd.notna(diff_group)
+                            result_group[valid_mask] = diff_group[valid_mask].dt.total_seconds().round(3)
+                            result_group[~valid_mask] = math.nan
+                            result_series.loc[group_indices] = result_group
                         except Exception:
-                            return math.nan
+                            # 念のためのフォールバック
+                            group_indices_list = list(group_indices)
+                            def _calc_group(row_idx):
+                                if row_idx not in group_indices_list:
+                                    return math.nan
+                                row = self.df_all.loc[row_idx]
+                                # オフセットを考慮して値を取得
+                                t0 = row.get(start_col) if start_offset == 0 else None
+                                if start_offset > 0:
+                                    try:
+                                        pos = group_indices_list.index(row_idx)
+                                        if pos + start_offset < len(group_indices_list):
+                                            next_idx = group_indices_list[pos + start_offset]
+                                            t0 = self.df_all.loc[next_idx].get(start_col)
+                                    except (ValueError, IndexError):
+                                        pass
+                                
+                                t1 = row.get(end_col) if end_offset == 0 else None
+                                if end_offset > 0:
+                                    try:
+                                        pos = group_indices_list.index(row_idx)
+                                        if pos + end_offset < len(group_indices_list):
+                                            next_idx = group_indices_list[pos + end_offset]
+                                            t1 = self.df_all.loc[next_idx].get(end_col)
+                                    except (ValueError, IndexError):
+                                        pass
+                                
+                                if pd.isna(t0) or pd.isna(t1):
+                                    return math.nan
+                                try:
+                                    return float((t1 - t0).total_seconds())
+                                except Exception:
+                                    return math.nan
 
-                    self.df_all[col_name] = pd.Series(
-                        [_calc(i) for i in range(len(self.df_all))],
-                        index=self.df_all.index
-                    )
+                            for idx in group_indices:
+                                result_series.loc[idx] = _calc_group(idx)
+                    
+                    self.df_all[col_name] = result_series
+                else:
+                    # user_idが存在しない場合の従来の処理
+                    # オフセットを考慮してSeriesを取得
+                    s = self.df_all[start_col]
+                    if start_offset > 0:
+                        s = s.shift(-start_offset)
+                    
+                    e = self.df_all[end_col]
+                    if end_offset > 0:
+                        e = e.shift(-end_offset)
+
+                    # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
+                    idx_s = pos_index.get(start_col)
+                    idx_e = pos_index.get(end_col)
+
+                    # オフセットがない場合のみ、従来の向き判定を使用
+                    if start_offset == 0 and end_offset == 0:
+                        if idx_s is not None and idx_e is not None and idx_s > idx_e:
+                            # start の方が"後" → end は次周の値を使う
+                            e_series = e.shift(-1)
+                        else:
+                            # 通常: 同一周回内
+                            e_series = e
+                    else:
+                        # オフセットが指定されている場合はそのまま使用
+                        e_series = e
+
+                    # None や NaN を含む行は NaN として処理
+                    mask_valid = pd.notna(s) & pd.notna(e_series)
+                    diff = pd.Series(index=s.index, dtype='timedelta64[ns]')
+                    diff[mask_valid] = e_series[mask_valid] - s[mask_valid]
+                    diff[~mask_valid] = pd.NaT
+
+                    # datetime → Timedelta → 秒
+                    try:
+                        result = pd.Series(index=diff.index, dtype=float)
+                        valid_mask = pd.notna(diff)
+                        result[valid_mask] = diff[valid_mask].dt.total_seconds().round(3)
+                        result[~valid_mask] = math.nan
+                        self.df_all[col_name] = result
+                    except Exception:
+                        # 念のためのフォールバック
+                        def _calc(row_idx):
+                            row = self.df_all.iloc[row_idx]
+                            # オフセットを考慮して値を取得
+                            t0 = row.get(start_col) if start_offset == 0 else None
+                            if start_offset > 0 and row_idx + start_offset < len(self.df_all):
+                                t0 = self.df_all.iloc[row_idx + start_offset].get(start_col)
+                            
+                            t1 = row.get(end_col) if end_offset == 0 else None
+                            if end_offset > 0 and row_idx + end_offset < len(self.df_all):
+                                t1 = self.df_all.iloc[row_idx + end_offset].get(end_col)
+                            
+                            if pd.isna(t0) or pd.isna(t1):
+                                return math.nan
+                            try:
+                                return float((t1 - t0).total_seconds())
+                            except Exception:
+                                return math.nan
+
+                        self.df_all[col_name] = pd.Series(
+                            [_calc(i) for i in range(len(self.df_all))],
+                            index=self.df_all.index
+                        )
 
 
     def _display_kpi_columns(self) -> list[str]:
@@ -835,11 +924,32 @@ class KPIPage(QWidget):
                 if not (c.startswith("imputed__") or c == "__row_id")
             ]
 
+            # すべてのモードのKPI列名を取得（別のモードのKPIを除外するため）
+            all_kpi_cols = set()
+            cfg = self._interval_config or {}
+            for mode, entries in cfg.items():
+                if not isinstance(entries, list):
+                    continue
+                for ent in entries:
+                    if not isinstance(ent, dict):
+                        continue
+                    start = ent.get("start")
+                    end = ent.get("end")
+                    if not start or not end:
+                        continue
+                    name = ent.get("name") or f"{start}-{end}"
+                    if name in self.df_all.columns:
+                        all_kpi_cols.add(name)
+
             priority: list[str] = []
             priority += [c for c in NAME_COLUMNS if c in all_cols]
-            priority += self._display_kpi_columns()
+            priority += self._display_kpi_columns()  # 現在のモードのKPI列のみ
 
-            extras = [c for c in all_cols if c not in priority]
+            # extrasには元のデータ列のみを含める（KPI列は除外）
+            extras = [
+                c for c in all_cols 
+                if c not in priority and c not in all_kpi_cols
+            ]
 
             seen = set()
             cols: list[str] = []

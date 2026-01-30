@@ -176,7 +176,7 @@ import unicodedata, re
 def split_laps(df, all_data=None, log_file=None):
     """
     シンプルなラップ分割:
-      - データは「0m,60m,AP1,50m,100m,BP,150m,AP2,200m,FP」の順で並ぶことを前提
+      - データは「FP,0m,60m,AP1,50m,100m,BP,150m,AP2,200m」の順で並ぶことを前提
       - この順序で1セット（1ラップ）として扱う
       - 完全にそろっているセットだけを1行目、2行目として表示する
       - SB1列を追加（0mの左に配置、user_idが紐づいていないデータから0mから5秒前までを検索）
@@ -200,8 +200,8 @@ def split_laps(df, all_data=None, log_file=None):
     
     logger = logging.getLogger(__name__)
     
-    # 期待される順序
-    expected_order = ["0m", "60m", "AP1", "50m", "100m", "BP", "150m", "AP2", "200m", "FP"]
+    # 期待される順序（FPから200mまで）
+    expected_order = ["FP", "0m", "60m", "AP1", "50m", "100m", "BP", "150m", "AP2", "200m"]
     
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -281,16 +281,16 @@ def split_laps(df, all_data=None, log_file=None):
         if pos in expected_order:
             # 既にラップが完成している場合（expected_idx >= len(expected_order)）
             if expected_idx >= len(expected_order):
-                # 前のラップが不完全な場合の処理（FPが抜けている）
+                # 前のラップが不完全な場合の処理（200mが抜けている）
                 if current_lap:
-                    # FPが抜けている：FPを空欄にして完成
-                    current_lap["FP"] = None
-                    logger.info(f"FPが抜けているため空欄に設定してラップを完成")
+                    # 200mが抜けている：200mを空欄にして完成
+                    current_lap["200m"] = None
+                    logger.info(f"200mが抜けているため空欄に設定してラップを完成")
                     complete_lap(current_lap, len(rows) + 1)
                     current_lap = {}
                 
                 # 新しいラップを開始
-                if pos == expected_order[0]:  # 0mから開始
+                if pos == expected_order[0]:  # FPから開始
                     current_lap[pos] = ts
                     expected_idx = 1
                 continue
@@ -302,7 +302,7 @@ def split_laps(df, all_data=None, log_file=None):
                 current_lap[pos] = ts
                 expected_idx += 1
                 
-                # 1セット完了（FPまで到達）
+                # 1セット完了（200mまで到達）
                 if expected_idx >= len(expected_order):
                     complete_lap(current_lap, len(rows) + 1)
                     current_lap = {}
@@ -312,11 +312,11 @@ def split_laps(df, all_data=None, log_file=None):
                 # 循環を考慮：FPの後は0mが来る
                 found_match = False
                 
-                # 200mまで到達した後、次のデータが0m（新しいラップの開始）の場合、FPが抜けている
+                # 200mまで到達した後、次のデータがFP（新しいラップの開始）の場合、200mが抜けている
                 if expected_idx == len(expected_order) - 1 and pos == expected_order[0]:
-                    # FPが抜けている：FPを空欄にしてラップを完成
-                    current_lap["FP"] = None
-                    logger.info(f"FPが抜けているため空欄に設定してラップを完成")
+                    # 200mが抜けている：200mを空欄にしてラップを完成
+                    current_lap["200m"] = None
+                    logger.info(f"200mが抜けているため空欄に設定してラップを完成")
                     complete_lap(current_lap, len(rows) + 1)
                     current_lap = {}
                     
@@ -326,15 +326,15 @@ def split_laps(df, all_data=None, log_file=None):
                     found_match = True
                 else:
                     # 1つ先、2つ先...とチェック（最大2つまで）
-                    # 循環を考慮：FPの後は0mが来るので、check_idxが範囲外の場合は0mをチェック
+                    # 循環を考慮：200mの後はFPが来るので、check_idxが範囲外の場合はFPをチェック
                     for skip_count in range(1, min(3, len(expected_order) - expected_idx + 2)):
                         check_idx = expected_idx + skip_count
                         
-                        # 循環を考慮：範囲外の場合は0m（expected_order[0]）をチェック
+                        # 循環を考慮：範囲外の場合はFP（expected_order[0]）をチェック
                         if check_idx < len(expected_order):
                             check_pos = expected_order[check_idx]
                         elif check_idx == len(expected_order) and pos == expected_order[0]:
-                            # FPの後は0mが来る（循環）
+                            # 200mの後はFPが来る（循環）
                             check_pos = expected_order[0]
                         else:
                             continue
@@ -344,7 +344,7 @@ def split_laps(df, all_data=None, log_file=None):
                             if check_idx < len(expected_order):
                                 missing_positions = [expected_order[i] for i in range(expected_idx, check_idx)]
                             else:
-                                # FPが抜けている場合
+                                # 200mが抜けている場合
                                 missing_positions = [expected_order[expected_idx]]
                             
                             if skip_count == 1:
@@ -356,10 +356,10 @@ def split_laps(df, all_data=None, log_file=None):
                                 if check_idx < len(expected_order):
                                     expected_idx = check_idx + 1
                                 else:
-                                    # FPの後は0m（循環）
+                                    # 200mの後はFP（循環）
                                     expected_idx = 1
                                 
-                                # 1セット完了（FPまで到達）
+                                # 1セット完了（200mまで到達）
                                 if expected_idx >= len(expected_order):
                                     complete_lap(current_lap, len(rows) + 1)
                                     current_lap = {}
@@ -373,7 +373,7 @@ def split_laps(df, all_data=None, log_file=None):
                                 expected_idx = 0
                                 
                                 # 新しいセットを開始
-                                if pos == expected_order[0]:  # 0mから開始
+                                if pos == expected_order[0]:  # FPから開始
                                     current_lap[pos] = ts
                                     expected_idx = 1
                                 found_match = True
@@ -387,7 +387,7 @@ def split_laps(df, all_data=None, log_file=None):
                     expected_idx = 0
                     
                     # 新しいセットを開始
-                    if pos == expected_order[0]:  # 0mから開始
+                    if pos == expected_order[0]:  # FPから開始
                         current_lap[pos] = ts
                         expected_idx = 1
     
@@ -428,12 +428,12 @@ def split_laps(df, all_data=None, log_file=None):
             return None
         result_df.insert(0, "Date", result_df.apply(get_date, axis=1))
     
-    # SB1列を0mの左に移動（Date列の後、0mの前）
+    # SB1列をFPの左に移動（Date列の後、FPの前）
     if "SB1" in result_df.columns and expected_order[0] in result_df.columns:
-        # SB1列を一旦削除してから0mの前に挿入
+        # SB1列を一旦削除してからFPの前に挿入
         sb1_col = result_df.pop("SB1")
-        zero_m_idx = result_df.columns.get_loc(expected_order[0])
-        result_df.insert(zero_m_idx, "SB1", sb1_col)
+        fp_idx = result_df.columns.get_loc(expected_order[0])
+        result_df.insert(fp_idx, "SB1", sb1_col)
     
     logger.info(f"結果DataFrame: {len(result_df)}行 x {len(result_df.columns)}列")
     logger.info(f"列名: {result_df.columns.tolist()}")
