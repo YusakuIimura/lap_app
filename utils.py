@@ -237,13 +237,11 @@ def split_laps(df, all_data=None, log_file=None):
             ].copy()
             logger.info(f"SB1候補データ: {len(sb1_candidates)}件")
     
-    # 順序通りに分割
+    # シンプルな分割：すべてのデータを拾う
     rows = []
     current_lap = {}
-    expected_idx = 0
     
     logger.info(f"データ処理開始: {len(df)}行")
-    logger.info(f"期待される順序: {expected_order}")
     
     def complete_lap(lap_dict, lap_num):
         """ラップを完成させてrowsに追加する"""
@@ -273,137 +271,31 @@ def split_laps(df, all_data=None, log_file=None):
         rows.append(lap_dict.copy())
         logger.info(f"ラップ {lap_num} 完了: {lap_dict}")
     
+    # シンプルな分割：FPまたは0mを検出したら新しいラップとして開始
     for idx, row in df.iterrows():
         pos = row["position"]
         ts = row["timestamp"]
         
-        # 期待される順序の位置を確認
-        if pos in expected_order:
-            # 既にラップが完成している場合（expected_idx >= len(expected_order)）
-            if expected_idx >= len(expected_order):
-                # 前のラップが不完全な場合の処理（200mが抜けている）
-                if current_lap:
-                    # 200mが抜けている：200mを空欄にして完成
-                    current_lap["200m"] = None
-                    logger.info(f"200mが抜けているため空欄に設定してラップを完成")
-                    complete_lap(current_lap, len(rows) + 1)
-                    current_lap = {}
-                
-                # 新しいラップを開始
-                if pos == expected_order[0]:  # FPから開始
-                    current_lap[pos] = ts
-                    expected_idx = 1
-                continue
+        # FPまたは0mを検出したら新しいラップとして開始
+        if pos == "FP" or pos == "0m":
+            # 前のラップがあれば完成させる
+            if current_lap:
+                lap_num = len(rows) + 1
+                complete_lap(current_lap, lap_num)
+                current_lap = {}
             
-            expected_pos = expected_order[expected_idx]
-            
-            if pos == expected_pos:
-                # 期待通りの位置
-                current_lap[pos] = ts
-                expected_idx += 1
-                
-                # 1セット完了（200mまで到達）
-                if expected_idx >= len(expected_order):
-                    complete_lap(current_lap, len(rows) + 1)
-                    current_lap = {}
-                    expected_idx = 0
-            else:
-                # 順序が合わない場合、何個抜けているかチェック
-                # 循環を考慮：FPの後は0mが来る
-                found_match = False
-                
-                # 200mまで到達した後、次のデータがFP（新しいラップの開始）の場合、200mが抜けている
-                if expected_idx == len(expected_order) - 1 and pos == expected_order[0]:
-                    # 200mが抜けている：200mを空欄にしてラップを完成
-                    current_lap["200m"] = None
-                    logger.info(f"200mが抜けているため空欄に設定してラップを完成")
-                    complete_lap(current_lap, len(rows) + 1)
-                    current_lap = {}
-                    
-                    # 新しいラップを開始
-                    current_lap[pos] = ts
-                    expected_idx = 1
-                    found_match = True
-                else:
-                    # 1つ先、2つ先...とチェック（最大2つまで）
-                    # 循環を考慮：200mの後はFPが来るので、check_idxが範囲外の場合はFPをチェック
-                    for skip_count in range(1, min(3, len(expected_order) - expected_idx + 2)):
-                        check_idx = expected_idx + skip_count
-                        
-                        # 循環を考慮：範囲外の場合はFP（expected_order[0]）をチェック
-                        if check_idx < len(expected_order):
-                            check_pos = expected_order[check_idx]
-                        elif check_idx == len(expected_order) and pos == expected_order[0]:
-                            # 200mの後はFPが来る（循環）
-                            check_pos = expected_order[0]
-                        else:
-                            continue
-                        
-                        if pos == check_pos:
-                            # skip_count個抜けている
-                            if check_idx < len(expected_order):
-                                missing_positions = [expected_order[i] for i in range(expected_idx, check_idx)]
-                            else:
-                                # 200mが抜けている場合
-                                missing_positions = [expected_order[expected_idx]]
-                            
-                            if skip_count == 1:
-                                # 1つだけ抜けている：空欄にして続行
-                                current_lap[missing_positions[0]] = None
-                                logger.info(f"位置 {missing_positions[0]} が抜けているため空欄に設定。次の位置 {pos} を記録")
-                                current_lap[pos] = ts
-                                
-                                if check_idx < len(expected_order):
-                                    expected_idx = check_idx + 1
-                                else:
-                                    # 200mの後はFP（循環）
-                                    expected_idx = 1
-                                
-                                # 1セット完了（200mまで到達）
-                                if expected_idx >= len(expected_order):
-                                    complete_lap(current_lap, len(rows) + 1)
-                                    current_lap = {}
-                                    expected_idx = 0
-                                found_match = True
-                                break
-                            else:
-                                # 2つ以上抜けている：ラップを廃棄
-                                logger.warning(f"不完全なラップを破棄（{skip_count}個の位置が抜けている: {missing_positions}）: {current_lap}")
-                                current_lap = {}
-                                expected_idx = 0
-                                
-                                # 新しいセットを開始
-                                if pos == expected_order[0]:  # FPから開始
-                                    current_lap[pos] = ts
-                                    expected_idx = 1
-                                found_match = True
-                                break
-                
-                if not found_match:
-                    # どの期待位置とも一致しない場合、ラップを廃棄
-                    if current_lap:
-                        logger.warning(f"順序不一致でラップ破棄: 期待={expected_pos}, 実際={pos}, 現在のセット={current_lap}")
-                    current_lap = {}
-                    expected_idx = 0
-                    
-                    # 新しいセットを開始
-                    if pos == expected_order[0]:  # FPから開始
-                        current_lap[pos] = ts
-                        expected_idx = 1
+            # 新しいラップを開始
+            current_lap[pos] = ts
+            continue
+        
+        # その他の位置は現在のラップに追加（既に記録されていない場合のみ）
+        if pos in expected_order and pos not in current_lap:
+            current_lap[pos] = ts
     
-    # 最後のセットが不完全な場合、1つだけ抜けている場合は完成させる
-    if current_lap and expected_idx < len(expected_order):
-        missing_count = len(expected_order) - expected_idx
-        if missing_count == 1:
-            # 1つだけ抜けている場合、最後の位置を空欄にして完成
-            last_expected_pos = expected_order[expected_idx]
-            current_lap[last_expected_pos] = None
-            logger.info(f"最後の位置 {last_expected_pos} が抜けているため空欄に設定してラップを完成")
-            complete_lap(current_lap, len(rows) + 1)
-        else:
-            # 2つ以上抜けている場合は破棄
-            missing_positions = [expected_order[i] for i in range(expected_idx, len(expected_order))]
-            logger.warning(f"不完全なラップを破棄（{missing_count}個の位置が抜けている: {missing_positions}）: {current_lap}")
+    # 最後のラップを完成させる
+    if current_lap:
+        lap_num = len(rows) + 1
+        complete_lap(current_lap, lap_num)
     
     logger.info(f"処理完了: {len(rows)}個のラップを取得（一部空欄を含む可能性あり）")
     
