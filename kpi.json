@@ -1,14 +1,25 @@
 {
+  "version": "ver2",
   "rolling": [
     {
       "start": "FP",
       "end": "BP",
-      "name": "RAC_0-125m"
+      "name": "FP-BP"
     },
     {
-      "start": "BP",
-      "end": "FP+1",
-      "name": "RAC_125-250m"
+      "start": "0m",
+      "end": "0m+1",
+      "name": "0m-0m+1"
+    },
+    {
+      "start": "0m+1",
+      "end": "0m+2",
+      "name": "0m+1-0m+2"
+    },
+    {
+      "start":"0m+2",
+      "end":"0m+3",
+      "name":"0m+2-3"
     }
   ],
   "standing": [
@@ -26,6 +37,11 @@
       "start": "SB1",
       "end": "FP+1",
       "name": "Split_0-250m"
+    },
+    {
+      "start": "0m+3",
+      "end": "0m+4",
+      "name": "0m+3-4"
     }
   ],
   "flying": [

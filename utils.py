@@ -31,20 +31,6 @@ translate_dict ={
 
 POINT_ORDER = ["FP","0m","60m","AP1","50m","100m","BP","150m","AP2","200m","FP_END"]
 
-# 隣接点の距離[m]
-SEGMENTS = [
-    ("FP_start", "0m_start", 17.97),
-    ("0m_start", "60m",      42.03),
-    ("60m",      "AP1",       2.50),
-    ("AP1",      "50m",       5.47),
-    ("50m",      "100m",     50.00),
-    ("100m",     "BP",        7.03),
-    ("BP",       "150m",     42.97),
-    ("150m",     "AP2",      19.53),
-    ("AP2",      "200m",     30.47),
-    ("200m",     "FP_END",   32.03),
-]
-
 SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
 
 def _load_json(path):
@@ -69,8 +55,6 @@ def _get_db_url_from_settings():
         raise RuntimeError("setting.json の db.name / db.user / db.pass を設定してください。")
     return f"{driver}://{user}:{passwd}@{host}:{port}/{name}"
 
-def _noop(*args, **kwargs): pass
-
 def jst_str_to_utc_sql(ts_jst_str: str) -> str:
     """
     'YYYY-MM-DD HH:MM:SS' (JST) を UTC の同フォーマット文字列に変換。
@@ -91,78 +75,6 @@ def to_jst_naive(series: pd.Series) -> pd.Series:
     s = pd.to_datetime(series, errors="coerce", utc=True)
     s = s.dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
     return s
-
-def _build_distance_map():
-    """SEGMENTSから列順と累積距離[m]を算出"""
-    order = ["FP_start"]
-    dist = {"FP_start": 0.0}
-    for a, b, d in SEGMENTS:
-        # a の累積距離が未登録なら直前の値を使う（通常は登録済み）
-        if a not in dist:
-            dist[a] = dist[order[-1]]
-        dist[b] = dist[a] + d
-        if b not in order:
-            order.append(b)
-    return order, dist
-
-def impute_times_by_distance(df_laps: pd.DataFrame) -> pd.DataFrame:
-    """
-    ラップ内タイムの欠損を距離比例で補完（外挿なし）。
-    併せて各タイム列ごとに imputed__{col} のブール列を付与して、どこを埋めたか保持する。
-    """
-    cols_order, dist_map = _build_distance_map()  # ["FP_start","0m_start",...,"200m","FP_END"]
-    df = df_laps.copy()
-
-    # 終端（次ラップのFP）を補完用に利用
-    df["FP_END"] = df.get("FP_2nd", pd.NaT)
-
-    # 各列のフラグ列を初期化（False）
-    flag_cols = [c for c in cols_order if c != "FP_END"]
-    for c in flag_cols:
-        df[f"imputed__{c}"] = False
-
-    for i in df.index:
-        times = df.loc[i, cols_order].copy()
-
-        # 既知インデックス
-        known_idx = [k for k, c in enumerate(cols_order) if pd.notna(times[c])]
-        if len(known_idx) < 2:
-            continue
-
-        # 既知のペアごとに距離比例で線形補間（挟まれている欠損のみ）
-        for a, b in zip(known_idx[:-1], known_idx[1:]):
-            colL, colR = cols_order[a], cols_order[b]
-            tL, tR = times[colL], times[colR]
-            if not (pd.notna(tL) and pd.notna(tR) and tR > tL):
-                continue
-
-            dL, dR = dist_map[colL], dist_map[colR]
-            span = dR - dL
-            if span <= 0:
-                continue
-
-            for k in range(a + 1, b):
-                ck = cols_order[k]
-                if ck == "FP_END":
-                    continue
-                if pd.isna(times[ck]):
-                    frac = (dist_map[ck] - dL) / span
-                    times[ck] = tL + (tR - tL) * frac
-                    df.at[i, f"imputed__{ck}"] = True  # ← 補完フラグON
-
-        # 反映
-        df.loc[i, cols_order] = times
-
-    # 作業列は落とす
-    df = df.drop(columns=["FP_END"])
-    return df
-
-CUM_DIST = {"FP": 0.0}
-_total = 0.0
-for a, b, d in SEGMENTS:
-    _total += d
-    CUM_DIST[b] = _total
-LAP_LENGTH = CUM_DIST["FP_END"]
 
 def get_df_from_db(query):
     engine = create_engine(_get_db_url_from_settings(), pool_pre_ping=True)
@@ -243,227 +155,144 @@ def split_laps(df, all_data=None, log_file=None):
     
     logger.info(f"データ処理開始: {len(df)}行")
     
-    def complete_lap(lap_dict, lap_num):
-        """ラップを完成させてrowsに追加する"""
-        # SB1を検索（0mから5秒前まで）
+    def complete_lap(lap_dict, lap_id):
+        """ラップを完成させてrowsに追加する（タイムスタンプ順に並べ替え）"""
+        # SB1とFP列を0mの左に配置
+        # 0mより5秒以内のSB1があればSB1列に入れる、0mより5秒以内のFPがあればFP列に入れる
         sb1_value = None
-        if sb1_candidates is not None and "0m" in lap_dict and lap_dict["0m"] is not None:
-            zero_m_time = lap_dict["0m"]
+        fp_value = None
+        
+        if "0m" in lap_dict and lap_dict["0m"] is not None:
+            zero_m_time = pd.to_datetime(lap_dict["0m"])
             time_window_start = zero_m_time - timedelta(seconds=5)
             time_window_end = zero_m_time
             
-            # 0mから5秒前までの範囲でSB1を検索
-            sb1_in_range = sb1_candidates[
-                (sb1_candidates["timestamp"] >= time_window_start) &
-                (sb1_candidates["timestamp"] <= time_window_end)
-            ]
+            # 0mより5秒以内のSB1を検索
+            if sb1_candidates is not None and len(sb1_candidates) > 0:
+                ts_col = pd.to_datetime(sb1_candidates["timestamp"])
+                sb1_in_range = sb1_candidates[
+                    (ts_col >= time_window_start) &
+                    (ts_col <= time_window_end)
+                ]
+                
+                if len(sb1_in_range) > 0:
+                    # 最も近いSB1を採用（0mに最も近いもの）
+                    sb1_in_range = sb1_in_range.sort_values("timestamp", ascending=False)
+                    sb1_value = sb1_in_range.iloc[0]["timestamp"]
+                    logger.info(f"LapID {lap_id}: SB1を検出 {sb1_value} (0m: {zero_m_time})")
             
-            if len(sb1_in_range) > 0:
-                # 最も近いSB1を採用（0mに最も近いもの）
-                sb1_in_range = sb1_in_range.sort_values("timestamp", ascending=False)
-                sb1_value = sb1_in_range.iloc[0]["timestamp"]
-                logger.info(f"ラップ {lap_num}: SB1を検出 {sb1_value} (0m: {zero_m_time})")
+            # 0mより5秒以内のFPを検索（df内から検索）
+            fp_candidates = df[df["position"] == "FP"].copy()
+            if len(fp_candidates) > 0:
+                ts_col = pd.to_datetime(fp_candidates["timestamp"])
+                fp_in_range = fp_candidates[
+                    (ts_col >= time_window_start) &
+                    (ts_col <= time_window_end)
+                ]
+                
+                if len(fp_in_range) > 0:
+                    # 最も近いFPを採用（0mに最も近いもの）
+                    fp_in_range = fp_in_range.sort_values("timestamp", ascending=False)
+                    fp_value = fp_in_range.iloc[0]["timestamp"]
+                    logger.info(f"LapID {lap_id}: FPを検出 {fp_value} (0m: {zero_m_time})")
         
-        # SB1を追加
-        lap_dict["SB1"] = sb1_value
+        # タイムスタンプ順に並べ替え
+        sorted_lap = {}
+        # タイムスタンプでソート
+        sorted_items = sorted(lap_dict.items(), key=lambda x: x[1] if x[1] is not None else pd.Timestamp.max)
+        for pos, ts in sorted_items:
+            # FPは後で設定するので、ここではスキップ
+            if pos != "FP":
+                sorted_lap[pos] = ts
+        
+        # SB1とFPを追加（0mの左に配置するため、後で列順序を調整）
+        sorted_lap["SB1"] = sb1_value
+        sorted_lap["FP"] = fp_value
+        
+        # LapIDを追加
+        sorted_lap["LapID"] = lap_id
         
         # セットを追加
-        rows.append(lap_dict.copy())
-        logger.info(f"ラップ {lap_num} 完了: {lap_dict}")
+        rows.append(sorted_lap.copy())
+        logger.info(f"LapID {lap_id} 完了: {sorted_lap}")
     
-    # シンプルな分割：FPまたは0mを検出したら新しいラップとして開始
+    # 0mを検出したら新しいLapIDを割り振る
+    # 時系列順に来たデータを順に格納していく
+    lap_id = 0
     for idx, row in df.iterrows():
         pos = row["position"]
         ts = row["timestamp"]
         
-        # FPまたは0mを検出したら新しいラップとして開始
-        if pos == "FP" or pos == "0m":
+        # 0mを検出したら新しいラップとして開始
+        if pos == "0m":
             # 前のラップがあれば完成させる
             if current_lap:
-                lap_num = len(rows) + 1
-                complete_lap(current_lap, lap_num)
+                lap_id += 1
+                complete_lap(current_lap, lap_id)
                 current_lap = {}
             
             # 新しいラップを開始
             current_lap[pos] = ts
-            continue
-        
-        # その他の位置は現在のラップに追加（既に記録されていない場合のみ）
-        if pos in expected_order and pos not in current_lap:
-            current_lap[pos] = ts
+        else:
+            # その他の位置は現在のラップに追加（current_lapが空でない場合のみ）
+            # 同じ位置が複数回来た場合は、最新のタイムスタンプで上書き
+            if current_lap:
+                current_lap[pos] = ts
     
     # 最後のラップを完成させる
     if current_lap:
-        lap_num = len(rows) + 1
-        complete_lap(current_lap, lap_num)
+        lap_id += 1
+        complete_lap(current_lap, lap_id)
     
     logger.info(f"処理完了: {len(rows)}個のラップを取得（一部空欄を含む可能性あり）")
     
     if not rows:
         logger.warning("ラップが0件でした")
-        columns_with_sb1 = ["SB1"] + expected_order
-        return pd.DataFrame(columns=columns_with_sb1)
+        columns_with_lapid = ["LapID", "SB1", "FP"] + expected_order
+        return pd.DataFrame(columns=columns_with_lapid)
     
-    # DataFrameに変換（SB1列を含む）
-    columns_with_sb1 = ["SB1"] + expected_order
-    result_df = pd.DataFrame(rows, columns=columns_with_sb1)
+    # DataFrameに変換（列順序は統一、各行のデータはタイムスタンプ順）
+    # すべての列を収集
+    all_columns = set(["LapID", "SB1", "FP"])
+    for lap_dict in rows:
+        all_columns.update(lap_dict.keys())
+    # LapIDを最初に、その後はSB1、FP、0mの順で、その後はexpected_orderの残り、最後にその他の列
+    ordered_columns = ["LapID", "SB1", "FP"]
+    # expected_orderからFPを除外して追加（FPは既に追加済み）
+    for col in expected_order:
+        if col in all_columns and col != "FP":
+            ordered_columns.append(col)
+    for col in sorted(all_columns - set(ordered_columns)):
+        if col not in ["LapID", "SB1", "FP"]:
+            ordered_columns.append(col)
+    
+    result_df = pd.DataFrame(rows, columns=ordered_columns)
     
     # Date列を追加（最初のタイムスタンプの日付、0mがNoneの場合は最初の有効なタイムスタンプを使用）
     if len(expected_order) > 0 and expected_order[0] in result_df.columns:
         first_col = expected_order[0]
         # 0mがNoneの場合は、最初の有効なタイムスタンプを探す
         def get_date(row):
-            # 0mから順に有効なタイムスタンプを探す
+            # SB1があればSB1を使用、SB1がなくてFPがあればFPを使用、なければ0mから順に有効なタイムスタンプを探す
+            if "SB1" in row and pd.notna(row["SB1"]) and row["SB1"] is not None:
+                return pd.to_datetime(row["SB1"]).date()
+            if "FP" in row and pd.notna(row["FP"]) and row["FP"] is not None:
+                return pd.to_datetime(row["FP"]).date()
             for col in expected_order:
                 if col in row and pd.notna(row[col]) and row[col] is not None:
                     return pd.to_datetime(row[col]).date()
             return None
         result_df.insert(0, "Date", result_df.apply(get_date, axis=1))
     
-    # SB1列をFPの左に移動（Date列の後、FPの前）
-    if "SB1" in result_df.columns and expected_order[0] in result_df.columns:
-        # SB1列を一旦削除してからFPの前に挿入
-        sb1_col = result_df.pop("SB1")
-        fp_idx = result_df.columns.get_loc(expected_order[0])
-        result_df.insert(fp_idx, "SB1", sb1_col)
-    
     logger.info(f"結果DataFrame: {len(result_df)}行 x {len(result_df.columns)}列")
     logger.info(f"列名: {result_df.columns.tolist()}")
-    logger.info(f"SB1非空値: {result_df['SB1'].notna().sum()}件")
+    if "SB1" in result_df.columns:
+        logger.info(f"SB1非空値: {result_df['SB1'].notna().sum()}件")
+    if "FP" in result_df.columns:
+        logger.info(f"FP非空値: {result_df['FP'].notna().sum()}件")
     
     return result_df
 
-
-def calculate_entry_speed(row):
-    # l = 17.97  # 0m-FP間距離（m）
-    # t1, t2 = row.get("0m_start"), row.get("FP_start")
-    # if pd.isna(t1) or pd.isna(t2):
-    #     return np.nan
-    # td = t1 - t2
-    # if pd.isna(td) or td.total_seconds() == 0:
-    #     return np.nan
-    # return round(l / td.total_seconds() * 3.6, 2)  # km/h
-    return ''
-
-def calculate_jump_speed(row):
-    # l = 17.97 + 50 - 250 / 4  # 50m-AP1間距離（m）
-    # t1, t2 = row.get("50m"), row.get("AP1")
-    # if pd.isna(t1) or pd.isna(t2):
-    #     return np.nan
-    # td = t1 - t2
-    # if pd.isna(td) or td.total_seconds() == 0:
-    #     return np.nan
-    # return round(l / td.total_seconds() * 3.6, 2)  # km/h
-    return ''
-
-def calculate_time_000_to_100(row):
-    t1, t2 = row.get("150m"), row.get("50m")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_100_to_200(row):
-    t1, t2 = row.get("0m_2nd"), row.get("150m")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_000_to_200(row):
-    t1, t2 = row.get("0m_2nd"), row.get("50m")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_000_to_625(row):
-    t1, t2 = row.get("AP1"), row.get("FP_start")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_625_to_125(row):
-    t1, t2 = row.get("BP"), row.get("AP1")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_000_to_125(row):
-    t1, t2 = row.get("BP"), row.get("FP_start")
-    if pd.isna(t1) or pd.isna(t2):
-        return np.nan
-    td = t1 - t2
-    if pd.isna(td) or td.total_seconds() == 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_125_to_250(row):
-    """BP → FP_2nd の秒数。どちらか欠けていたら NaN。0以下は NaN。"""
-    t0, t1 = row.get("BP"), row.get("FP_2nd")
-    if pd.isna(t0) or pd.isna(t1):
-        return np.nan
-    dt = t1 - t0
-    return round(dt.total_seconds(), 3) if pd.notna(dt) and dt.total_seconds() > 0 else np.nan
-
-def calculate_time_000_to_625_from_sb(row):
-    """standing 用：SB1→AP1 の秒数（SB1が無ければ NaN、補完しない）"""
-    t0, t1 = row.get("SB1"), row.get("AP1")
-    if pd.isna(t0) or pd.isna(t1):
-        return np.nan
-    td = t1 - t0
-    if pd.isna(td) or td.total_seconds() <= 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-def calculate_time_000_to_125_from_sb(row):
-    """standing 用：SB1→BP の秒数（SB1が無ければ NaN、補完しない）"""
-    t0, t1 = row.get("SB1"), row.get("BP")
-    if pd.isna(t0) or pd.isna(t1):
-        return np.nan
-    td = t1 - t0
-    if pd.isna(td) or td.total_seconds() <= 0:
-        return np.nan
-    return round(td.total_seconds(), 3)
-
-
-# utils.py 内：KPI計算の直後あたりに追加
-def _propagate_imputed_flags_to_kpi(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    タイム列の imputed__* を KPI列へ伝搬する。
-    df に存在する列だけで安全に OR を取る。
-    """
-    # ← 添付 utils.py の計算式に合わせた依存関係
-    deps_map = {
-        "entry_speed":   ["FP_start", "0m_start"],
-        "jump_speed":    ["50m", "AP1"],
-        "Time000to100":  ["150m", "50m"],
-        "Time100to200": ["0m_2nd", "150m"],
-        "Time000to200":  ["0m_2nd", "50m"],
-    }
-
-    for kpi, deps in deps_map.items():
-        if kpi not in df.columns:
-            continue
-        m = pd.Series(False, index=df.index)
-        for d in deps:
-            fcol = f"imputed__{d}"
-            if fcol in df.columns:
-                m = m | df[fcol].fillna(False)
-        df[f"imputed__{kpi}"] = m
-    return df
 
 def fetch_df_from_db(
     query: str,
@@ -471,7 +300,7 @@ def fetch_df_from_db(
     cancel_event: Optional[threading.Event] = None,
 ):
     """
-    DB→前処理→split→補間→結合 を行う。
+    DB→前処理→split→結合 を行う。
     - progress(msg): 進捗メッセージをUIへ通知（未指定なら無視）
     - cancel_event: .set() されていたら安全に中断（未指定なら無視）
     戻り値: (result_df, users)
@@ -563,6 +392,8 @@ def fetch_df_from_db(
     print(f"[DBG] result columns: {result_df.columns.tolist()}")
     if "SB1" in result_df.columns:
         print(f"[DBG] result SB1_nonnull: {int(result_df['SB1'].notna().sum())}")
+    if "FP" in result_df.columns:
+        print(f"[DBG] result FP_nonnull: {int(result_df['FP'].notna().sum())}")
 
     _p("完了")
     return result_df, users

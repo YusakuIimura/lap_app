@@ -1,0 +1,19 @@
+{
+  "ui": {
+    "time_mode": "rolling",
+    "start_datetime": "2026-02-16 13:00:00",
+    "end_datetime": "2026-02-16 15:00:00",
+    "font_family": "Meiryo",
+    "font_size": 9
+  },
+  "db": {
+    "driver": "mysql+pymysql",
+    "host": "trackview-instance-1.chakc5iaoqqz.ap-northeast-1.rds.amazonaws.com",
+    "port": 3306,
+    "name": "trackview",
+    "user": "readonly",
+    "pass": "cyvri5-Funcyb-cesfuk",
+    "url": ""
+  },
+  "image_path": "track-ref.jpg"
+}

@@ -2,7 +2,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QPushButton,
     QLineEdit, QHBoxLayout, QTableView, QFormLayout, QCheckBox,
     QAbstractItemView, QMessageBox, QFileDialog, QRadioButton, QButtonGroup, QHeaderView,
-    QMenu, QAction, QComboBox,QTableWidget, QTableWidgetItem
+    QMenu, QAction, QComboBox,QTableWidget, QTableWidgetItem, QDialog
 )
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QPoint
 from PyQt5.QtGui import QBrush, QColor, QGuiApplication, QKeySequence, QPixmap
@@ -15,7 +15,7 @@ import json
 import os
 import re
 
-from utils import fetch_df_from_db
+from utils import get_df_from_db, to_jst_naive, translate_dict
 
 # --------------------------------------------------------------------------------------
 # 共通定数 / ヘルパ
@@ -25,9 +25,9 @@ SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
 KPI_INTERVALS_PATH = os.path.join(os.getcwd(), "kpi.json")
 
 TRACK_ORDER = [
-    "FP_start",
+    "FP",
     "SB1",
-    "0m_start",
+    "0m",
     "60m",
     "AP1",
     "50m",
@@ -36,8 +36,6 @@ TRACK_ORDER = [
     "150m",
     "AP2",
     "200m",
-    "FP_2nd",
-    "0m_2nd",
 ]
 # 名前系は常に先頭に出したい列
 NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
@@ -54,17 +52,6 @@ def _save_json(path: str, obj: dict):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-
-def _load_kpi_intervals(path: str) -> dict:
-    """kpi.json から interval 定義を読み込む（壊れていたら空 dict）"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
 
 
 # --------------------------------------------------------------------------------------
@@ -416,11 +403,9 @@ class KPIJsonEditorPage(QWidget):
             QMessageBox.warning(self, "Save Failed", f"Failed to save kpi.json:\n{e}")
             return
 
-        # 親ページに反映してテーブル更新
+        # 親ページに反映
         self.kpi_page._interval_config = self._config
-        self.kpi_page._ensure_interval_columns()
-        self.kpi_page._build_filters()
-        self.kpi_page._rebuild_table(self.kpi_page.debug_all_cols.isChecked())
+        # KPI計算はエフォートごとに行うため、ここでは不要
 
         QMessageBox.information(self, "Saved Successfully", "kpi.json has been saved.")
 
@@ -434,11 +419,151 @@ class KPIJsonEditorPage(QWidget):
 # KPI Page 本体
 # --------------------------------------------------------------------------------------
 
+class EffortRawDataPage(QDialog):
+    """
+    エフォートの生データを表示するダイアログ（別ウィンドウ）
+    """
+    
+    def __init__(self, kpi_page: "KPIPage", effort_data: dict):
+        super().__init__(kpi_page)
+        self.kpi_page = kpi_page
+        self.effort_data = effort_data
+        
+        # モーダルレス（非モーダル）で開くように設定
+        self.setModal(False)
+        # 閉じられたときに自動的に削除されるように設定
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        # 常に前面に来ないようにウィンドウフラグを設定
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint)
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        self.setWindowTitle("エフォート生データ")
+        self.setMinimumSize(1000, 600)
+        main_layout = QVBoxLayout()
+        
+        # タイトル
+        title = QLabel(f"エフォート生データ - {self.effort_data.get('player_name', 'Unknown')}")
+        title.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        main_layout.addWidget(title)
+        
+        # エフォート情報
+        info_layout = QHBoxLayout()
+        info_layout.addWidget(QLabel(f"Start: {self.effort_data.get('start_time')}"))
+        info_layout.addWidget(QLabel(f"Date: {self.effort_data.get('date')}"))
+        info_layout.addStretch()
+        main_layout.addLayout(info_layout)
+        
+        # テーブル
+        self.table = QTableView()
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setAlternatingRowColors(True)
+        main_layout.addWidget(self.table)
+        
+        # ボタン
+        button_layout = QHBoxLayout()
+        
+        # CSV保存ボタン
+        save_csv_btn = QPushButton("Save as CSV")
+        save_csv_btn.clicked.connect(self._save_to_csv)
+        button_layout.addWidget(save_csv_btn)
+        
+        button_layout.addStretch()
+        
+        # 閉じるボタン
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(close_btn)
+        
+        main_layout.addLayout(button_layout)
+        
+        self.setLayout(main_layout)
+        
+        # データを表示
+        self._load_data()
+    
+    def _load_data(self):
+        """エフォートの生データをテーブルに表示"""
+        if not self.effort_data.get("data_points"):
+            self.model = DataFrameModel(pd.DataFrame())
+            self.table.setModel(self.model)
+            return
+        
+        # data_pointsをDataFrameに変換
+        data_points = self.effort_data["data_points"]
+        df = pd.DataFrame(data_points)
+        
+        if df.empty:
+            self.model = DataFrameModel(pd.DataFrame())
+            self.table.setModel(self.model)
+            return
+        
+        # timestamp順にソート
+        if "timestamp" in df.columns:
+            df = df.sort_values("timestamp").reset_index(drop=True)
+        
+        # すべての列を表示（エフォートとして検出されたデータをそのまま表示）
+        df_view = df.copy()
+        
+        self.model = DataFrameModel(df_view)
+        self.table.setModel(self.model)
+        
+        # 見た目調整
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        
+        default_width = 160
+        wider = {"first_name": 160, "last_name": 160}
+        visible_cols = list(self.model._df.columns)
+        for i, c in enumerate(visible_cols):
+            self.table.setColumnWidth(i, wider.get(c, default_width))
+        self.table.verticalHeader().setDefaultSectionSize(26)
+        
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+    
+    def _save_to_csv(self):
+        """エフォートの生データをCSVファイルに保存"""
+        if not hasattr(self, 'model') or self.model._df.empty:
+            QMessageBox.warning(self, "エラー", "保存するデータがありません")
+            return
+        
+        # ファイル保存ダイアログ
+        player_name = self.effort_data.get('player_name', 'Unknown').replace(' ', '_')
+        date_str = ""
+        if self.effort_data.get('date'):
+            date = self.effort_data['date']
+            if isinstance(date, (pd.Timestamp, datetime.datetime)):
+                date_str = date.strftime("%Y%m%d_%H%M%S")
+            else:
+                date_str = str(date).replace(' ', '_').replace(':', '')
+        
+        default_filename = f"effort_{player_name}_{date_str}.csv"
+        
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save CSV",
+            default_filename,
+            "CSV Files (*.csv)"
+        )
+        
+        if not path:
+            return
+        
+        try:
+            # DataFrameをCSVに保存
+            self.model._df.to_csv(path, index=False, encoding="utf-8-sig")
+            QMessageBox.information(self, "保存完了", f"CSVファイルを保存しました:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "保存エラー", f"CSVファイルの保存に失敗しました:\n{e}")
+    
 class KPIPage(QWidget):
     """
     KPIページ
-    - データ処理ロジック（DB 取得 / KPI 計算）は _load_data_and_prepare_kpi 系に集約
-    - UI 構築は _build_ui / _build_filters / _rebuild_table で担当
+    - データ処理ロジック（DB 取得）は _load_data 系に集約
+    - UI 構築は _build_ui で担当
     """
 
     # ------------------------------------------------------------------
@@ -452,14 +577,24 @@ class KPIPage(QWidget):
         self._user_ids = list(map(int, user_ids))
 
         self._settings = _load_json(SETTINGS_PATH)
-        self._interval_config: dict = {}
+        # kpi.jsonを読み込む
+        self._interval_config = _load_json(KPI_INTERVALS_PATH) or {}
+        
+        # versionチェック
+        config_version = self._interval_config.get("version")
+        if config_version != "ver2":
+            version_msg = f"Found: {config_version}" if config_version else "Version key not found"
+            QMessageBox.critical(
+                self,
+                "Version Error",
+                f"Invalid kpi.json version.\nExpected: ver2\n{version_msg}\n\nPlease update kpi.json to version ver2."
+            )
+            # アプリを終了
+            import sys
+            sys.exit(1)
+        
+        print(f"[KPI設定読み込み] バージョン: {config_version}, モード: {[k for k in self._interval_config.keys() if k != 'version']}")
 
-        # フィルタ用
-        self.filter_kpi_combo: QComboBox | None = None
-        self.filter_min_edit: QLineEdit | None = None
-        self.filter_max_edit: QLineEdit | None = None
-        self._filter_stats: dict[str, tuple[float | None, float | None]] = {}
-        self._current_filter_col: str | None = None
 
         # time_mode 初期値
         ui_mode = (self._settings.get("ui", {}).get("time_mode") or "rolling").lower()
@@ -472,247 +607,63 @@ class KPIPage(QWidget):
         else:
             self.time_mode = "rolling"
 
-        # データ読み込み + KPI 準備（Data ロジック）
+        # データ読み込み（Data ロジック）
         self.df_all = pd.DataFrame()
-        self._load_data_and_prepare_kpi()
+        self._load_data()
 
         # UI 構築（UI ロジック）
         self._build_ui()
-
-        # フィルタ・テーブル初期化
-        self._build_filters()
-        self._rebuild_table(self.debug_all_cols.isChecked())
+        
+        # エフォート検出とテーブル更新
+        self._detect_and_display_efforts()
         
         self.track_image_path = self._settings.get("image_path", "")
+    
+    def mousePressEvent(self, event):
+        """マウスクリック時にウィンドウを前面に表示"""
+        super().mousePressEvent(event)
+        # 親ウィンドウを取得して前面に表示
+        parent_window = self.window()
+        if parent_window:
+            parent_window.raise_()
+            parent_window.activateWindow()
  
     # ------------------------------------------------------------------
     # データロジック
     # ------------------------------------------------------------------
-    def _load_data_and_prepare_kpi(self):
-        """DB から df_all を取得し、区間列とモード別 KPI を構築する。"""
-        df_any, _users = fetch_df_from_db(self._base_query, progress=lambda m: print(f"[KPI] {m}"))
-        df_any = df_any.copy()
+    def _load_data(self):
+        """DB から生データを取得する（シンプル版）"""
+        print("[データ読み込み] DB問い合わせ中…")
+        df = get_df_from_db(self._base_query)
 
-        if "__row_id" not in df_any.columns:
-            df_any["__row_id"] = range(len(df_any))
-
-        self.df_all = df_any
-
-        # kpi.json から interval 定義を読み込み
-        self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
-
-        # ラップタイム列から区間タイム列を追加
-        self._ensure_interval_columns()
-
-    def _ensure_interval_columns(self):
-        """
-        kpi.json の start/end 定義に基づき、区間タイム列を self.df_all に追加する。
-
-        - name があれば列名に使用
-        - name がなければ "start-end" を列名にする
-        - TRACK_ORDER 上で start が end より後ろの場合は
-          「start(この周回) → end(次周)」として計算する
-        """
-        if self.df_all.empty:
+        if df.empty:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "No data found for the selected conditions.\nReturning to the previous page."
+            )
+            self.go_back()
             return
-
-        cfg = self._interval_config or {}
-        pos_index = {name: i for i, name in enumerate(TRACK_ORDER)}
-
-        def parse_position_with_offset(pos_str):
-            """
-            地点名から列名とオフセットを抽出
-            例: "0m+1" -> ("0m", 1), "200m+2" -> ("200m", 2), "0m" -> ("0m", 0)
-            """
-            if not pos_str:
-                return None, 0
-            
-            # +1, +2などのオフセットを抽出
-            match = re.match(r'^(.+?)(\+(\d+))?$', pos_str)
-            if match:
-                col_name = match.group(1)
-                offset_str = match.group(3)
-                offset = int(offset_str) if offset_str else 0
-                return col_name, offset
-            return pos_str, 0
-
-        for mode, entries in cfg.items():
-            if not isinstance(entries, list):
-                continue
-
-            for ent in entries:
-                start_str = ent.get("start")
-                end_str = ent.get("end")
-                if not start_str or not end_str:
-                    continue
-
-                # 地点名とオフセットを解析
-                start_col, start_offset = parse_position_with_offset(start_str)
-                end_col, end_offset = parse_position_with_offset(end_str)
-
-                col_name = ent.get("name") or f"{start_str}-{end_str}"
-
-                # すでに列があるなら再計算しない
-                if col_name in self.df_all.columns:
-                    continue
-
-                # 必要な地点タイムが無ければスキップ
-                if start_col not in self.df_all.columns or end_col not in self.df_all.columns:
-                    continue
-
-                # 選手ごとにグループ化してKPIを計算
-                # user_idが存在する場合はグループ化、存在しない場合は全体を1つのグループとして扱う
-                group_key = "user_id" if "user_id" in self.df_all.columns else None
-                
-                if group_key:
-                    # 選手ごとにグループ化
-                    result_series = pd.Series(index=self.df_all.index, dtype=float)
-                    
-                    for user_id, group in self.df_all.groupby(group_key):
-                        group_indices = group.index
-                        
-                        # グループ内でのオフセットを考慮してSeriesを取得
-                        s_group = group[start_col].copy()
-                        if start_offset > 0:
-                            s_group = s_group.shift(-start_offset)
-                        
-                        e_group = group[end_col].copy()
-                        if end_offset > 0:
-                            e_group = e_group.shift(-end_offset)
-
-                        # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
-                        idx_s = pos_index.get(start_col)
-                        idx_e = pos_index.get(end_col)
-
-                        # オフセットがない場合のみ、従来の向き判定を使用
-                        if start_offset == 0 and end_offset == 0:
-                            if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                                # start の方が"後" → end は次周の値を使う
-                                e_series_group = e_group.shift(-1)
-                            else:
-                                # 通常: 同一周回内
-                                e_series_group = e_group
-                        else:
-                            # オフセットが指定されている場合はそのまま使用
-                            e_series_group = e_group
-
-                        # None や NaN を含む行は NaN として処理
-                        mask_valid = pd.notna(s_group) & pd.notna(e_series_group)
-                        diff_group = pd.Series(index=group_indices, dtype='timedelta64[ns]')
-                        diff_group[mask_valid] = e_series_group[mask_valid] - s_group[mask_valid]
-                        diff_group[~mask_valid] = pd.NaT
-
-                        # datetime → Timedelta → 秒
-                        try:
-                            result_group = pd.Series(index=group_indices, dtype=float)
-                            valid_mask = pd.notna(diff_group)
-                            result_group[valid_mask] = diff_group[valid_mask].dt.total_seconds().round(3)
-                            result_group[~valid_mask] = math.nan
-                            result_series.loc[group_indices] = result_group
-                        except Exception:
-                            # 念のためのフォールバック
-                            group_indices_list = list(group_indices)
-                            def _calc_group(row_idx):
-                                if row_idx not in group_indices_list:
-                                    return math.nan
-                                row = self.df_all.loc[row_idx]
-                                # オフセットを考慮して値を取得
-                                t0 = row.get(start_col) if start_offset == 0 else None
-                                if start_offset > 0:
-                                    try:
-                                        pos = group_indices_list.index(row_idx)
-                                        if pos + start_offset < len(group_indices_list):
-                                            next_idx = group_indices_list[pos + start_offset]
-                                            t0 = self.df_all.loc[next_idx].get(start_col)
-                                    except (ValueError, IndexError):
-                                        pass
-                                
-                                t1 = row.get(end_col) if end_offset == 0 else None
-                                if end_offset > 0:
-                                    try:
-                                        pos = group_indices_list.index(row_idx)
-                                        if pos + end_offset < len(group_indices_list):
-                                            next_idx = group_indices_list[pos + end_offset]
-                                            t1 = self.df_all.loc[next_idx].get(end_col)
-                                    except (ValueError, IndexError):
-                                        pass
-                                
-                                if pd.isna(t0) or pd.isna(t1):
-                                    return math.nan
-                                try:
-                                    return float((t1 - t0).total_seconds())
-                                except Exception:
-                                    return math.nan
-
-                            for idx in group_indices:
-                                result_series.loc[idx] = _calc_group(idx)
-                    
-                    self.df_all[col_name] = result_series
-                else:
-                    # user_idが存在しない場合の従来の処理
-                    # オフセットを考慮してSeriesを取得
-                    s = self.df_all[start_col]
-                    if start_offset > 0:
-                        s = s.shift(-start_offset)
-                    
-                    e = self.df_all[end_col]
-                    if end_offset > 0:
-                        e = e.shift(-end_offset)
-
-                    # 向きの判定：TRACK_ORDER に両方ある場合だけ厳密な比較
-                    idx_s = pos_index.get(start_col)
-                    idx_e = pos_index.get(end_col)
-
-                    # オフセットがない場合のみ、従来の向き判定を使用
-                    if start_offset == 0 and end_offset == 0:
-                        if idx_s is not None and idx_e is not None and idx_s > idx_e:
-                            # start の方が"後" → end は次周の値を使う
-                            e_series = e.shift(-1)
-                        else:
-                            # 通常: 同一周回内
-                            e_series = e
-                    else:
-                        # オフセットが指定されている場合はそのまま使用
-                        e_series = e
-
-                    # None や NaN を含む行は NaN として処理
-                    mask_valid = pd.notna(s) & pd.notna(e_series)
-                    diff = pd.Series(index=s.index, dtype='timedelta64[ns]')
-                    diff[mask_valid] = e_series[mask_valid] - s[mask_valid]
-                    diff[~mask_valid] = pd.NaT
-
-                    # datetime → Timedelta → 秒
-                    try:
-                        result = pd.Series(index=diff.index, dtype=float)
-                        valid_mask = pd.notna(diff)
-                        result[valid_mask] = diff[valid_mask].dt.total_seconds().round(3)
-                        result[~valid_mask] = math.nan
-                        self.df_all[col_name] = result
-                    except Exception:
-                        # 念のためのフォールバック
-                        def _calc(row_idx):
-                            row = self.df_all.iloc[row_idx]
-                            # オフセットを考慮して値を取得
-                            t0 = row.get(start_col) if start_offset == 0 else None
-                            if start_offset > 0 and row_idx + start_offset < len(self.df_all):
-                                t0 = self.df_all.iloc[row_idx + start_offset].get(start_col)
-                            
-                            t1 = row.get(end_col) if end_offset == 0 else None
-                            if end_offset > 0 and row_idx + end_offset < len(self.df_all):
-                                t1 = self.df_all.iloc[row_idx + end_offset].get(end_col)
-                            
-                            if pd.isna(t0) or pd.isna(t1):
-                                return math.nan
-                            try:
-                                return float((t1 - t0).total_seconds())
-                            except Exception:
-                                return math.nan
-
-                        self.df_all[col_name] = pd.Series(
-                            [_calc(i) for i in range(len(self.df_all))],
-                            index=self.df_all.index
-                        )
-
+        
+        # タイムスタンプをJST（naive）へ変換
+        if "timestamp" in df.columns:
+            df["timestamp"] = to_jst_naive(df["timestamp"])
+        
+        # デコーダ→地点名
+        if "decoder_id" in df.columns:
+            df["position"] = df["decoder_id"].map(translate_dict).fillna("Unknown")
+        else:
+            df["position"] = "Unknown"
+        
+        # 時系列でソート
+        self.df_all = df.sort_values("timestamp").reset_index(drop=True)
+        
+        print(f"[データ読み込み] 生データ: {len(self.df_all)}行")
+        if not self.df_all.empty:
+            print(f"[データ読み込み] 列: {self.df_all.columns.tolist()}")
+            print(f"[データ読み込み] 最初の5行:")
+            print(self.df_all.head())
+        
 
     def _display_kpi_columns(self) -> list[str]:
         """
@@ -725,26 +676,495 @@ class KPIPage(QWidget):
         mode = (self.time_mode or "rolling").lower()
         cfg = self._interval_config or {}
         entries = cfg.get(mode, [])
+        
+        print(f"[KPI列取得] モード: {mode}, エントリ数: {len(entries)}")
 
         cols: list[str] = []
-        for ent in entries:
+        for ent_idx, ent in enumerate(entries):
             if not isinstance(ent, dict):
+                print(f"  [エントリ {ent_idx + 1}] 辞書型ではありません: {ent}")
                 continue
             start = ent.get("start")
             end = ent.get("end")
+            name = ent.get("name")
+            
+            print(f"  [エントリ {ent_idx + 1}] start={start}, end={end}, name={name}")
+            
             if not start or not end:
+                print(f"  [エントリ {ent_idx + 1}] startまたはendが無効のためスキップ")
                 continue
-            name = ent.get("name") or f"{start}-{end}"
-            cols.append(name)
+            
+            # nameがあればname、なければ "start-end" を使用
+            col_name = name if name else f"{start}-{end}"
+            cols.append(col_name)
+            print(f"  [エントリ {ent_idx + 1}] KPI列名: {col_name}")
 
-        # 実際に DataFrame に存在するものだけ
-        return [c for c in cols if c in self.df_all.columns]
+        print(f"[KPI列取得] 最終的なKPI列: {cols}")
+        return cols
+
+    # ------------------------------------------------------------------
+    # エフォート検出ロジック
+    # ------------------------------------------------------------------
+    def _calculate_kpi_for_effort(self, effort_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        エフォートのDataFrameに対してKPI列を計算する
+        
+        Args:
+            effort_df: エフォートのデータポイントから作成したDataFrame（各行が1つの位置のデータポイント）
+            
+        Returns:
+            KPI列が追加されたDataFrame
+        """
+        if effort_df.empty:
+            return effort_df
+        
+        # 結果DataFrameをコピー
+        result_df = effort_df.copy()
+        
+        # timestamp列とposition列が必要
+        if "timestamp" not in result_df.columns or "position" not in result_df.columns:
+            return result_df
+        
+        # timestamp順にソート
+        result_df = result_df.sort_values("timestamp").reset_index(drop=True)
+        
+        # 現在のモードに基づいてKPI列を計算
+        cfg = self._interval_config or {}
+        mode = (self.time_mode or "rolling").lower()
+        entries = cfg.get(mode, [])
+        
+        if not isinstance(entries, list):
+            return result_df
+        
+        def parse_position_with_offset(pos_str):
+            """地点名から位置名とオフセットを抽出（例: "0m+1" -> ("0m", 1)）"""
+            if not pos_str:
+                return None, 0
+            match = re.match(r'^(.+?)(\+(\d+))?$', pos_str)
+            if match:
+                pos_name = match.group(1)
+                offset_str = match.group(3)
+                offset = int(offset_str) if offset_str else 0
+                return pos_name, offset
+            return pos_str, 0
+        
+        def find_position_timestamp(position_name, offset=0):
+            """指定された位置のtimestampを取得（offsetでn個後の位置を指定）"""
+            matching_rows = result_df[result_df["position"] == position_name]
+            print(f"      [位置検索] 位置名: {position_name}, オフセット: {offset}, マッチ数: {len(matching_rows)}")
+            if matching_rows.empty:
+                print(f"      [位置検索] 位置 '{position_name}' が見つかりません")
+                return None
+            
+            idx = offset
+            if idx < len(matching_rows):
+                timestamp = matching_rows.iloc[idx]["timestamp"]
+                print(f"      [位置検索] 見つかったtimestamp: {timestamp} (インデックス: {idx})")
+                return timestamp
+            print(f"      [位置検索] オフセット {offset} が範囲外です（最大: {len(matching_rows) - 1}）")
+            return None
+        
+        print(f"[KPI計算開始] エフォートデータ: {len(result_df)}行, モード: {mode}, KPI定義数: {len(entries)}")
+        print(f"[KPI計算開始] 利用可能な位置: {result_df['position'].unique().tolist()}")
+        
+        for ent_idx, ent in enumerate(entries):
+            if not isinstance(ent, dict):
+                print(f"  [KPI {ent_idx + 1}] エントリが辞書型ではありません: {ent}")
+                continue
+                
+            start_str = ent.get("start")
+            end_str = ent.get("end")
+            name_str = ent.get("name")
+            
+            print(f"  [KPI {ent_idx + 1}] エントリ内容: start={start_str}, end={end_str}, name={name_str}")
+            
+            if not start_str or not end_str:
+                print(f"  [KPI {ent_idx + 1}] startまたはendが無効: start={start_str}, end={end_str}")
+                continue
+            
+            # 位置名とオフセットを解析
+            start_pos, start_offset = parse_position_with_offset(start_str)
+            end_pos, end_offset = parse_position_with_offset(end_str)
+            
+            # 列名はnameを使用（nameがなければ "start-end"）
+            col_name = name_str if name_str else f"{start_str}-{end_str}"
+            print(f"  [KPI {ent_idx + 1}] KPI列名: {col_name}")
+            print(f"  [KPI {ent_idx + 1}] start解析: 位置={start_pos}, オフセット={start_offset}")
+            print(f"  [KPI {ent_idx + 1}] end解析: 位置={end_pos}, オフセット={end_offset}")
+            
+            # すでに列があるなら再計算しない
+            if col_name in result_df.columns:
+                print(f"    [KPI {ent_idx + 1}] 既に列が存在するためスキップ")
+                continue
+            
+            # 開始位置と終了位置のtimestampを取得
+            start_time = find_position_timestamp(start_pos, start_offset)
+            end_time = find_position_timestamp(end_pos, end_offset)
+            
+            print(f"    [KPI {ent_idx + 1}] start_time={start_time}, end_time={end_time}")
+            
+            # 該当するデータがなければNaN
+            if start_time is None or end_time is None:
+                if start_time is None:
+                    print(f"    [KPI {ent_idx + 1}] start位置 '{start_pos}' (オフセット={start_offset}) が見つかりません")
+                if end_time is None:
+                    print(f"    [KPI {ent_idx + 1}] end位置 '{end_pos}' (オフセット={end_offset}) が見つかりません")
+                print(f"    [KPI {ent_idx + 1}] データが見つからないためNaNを設定")
+                result_df[col_name] = math.nan
+                continue
+            
+            # 時刻の差を計算（秒）
+            try:
+                time_diff = (end_time - start_time).total_seconds()
+                kpi_value = round(time_diff, 3)
+                print(f"    [KPI {ent_idx + 1}] 計算結果: {kpi_value}秒 (start={start_time}, end={end_time})")
+                # すべての行に同じ値を設定
+                result_df[col_name] = kpi_value
+                print(f"    [KPI {ent_idx + 1}] 列 '{col_name}' に値 {kpi_value} を設定しました")
+                # 設定後の値を確認
+                if col_name in result_df.columns:
+                    actual_value = result_df[col_name].iloc[0]
+                    print(f"    [KPI {ent_idx + 1}] 設定後の確認: 最初の行の値 = {actual_value}")
+            except Exception as e:
+                print(f"    [KPI {ent_idx + 1}] 計算エラー: {e}")
+                import traceback
+                traceback.print_exc()
+                result_df[col_name] = math.nan
+        
+        print(f"[KPI計算] 計算後の列: {result_df.columns.tolist()}")
+        print(f"[KPI計算] 計算後の行数: {len(result_df)}")
+        if not result_df.empty:
+            print(f"[KPI計算] 最初の行の列名: {list(result_df.iloc[0].index)}")
+            # KPI列の値を確認
+            kpi_cols = self._display_kpi_columns()
+            for kpi_col in kpi_cols:
+                if kpi_col in result_df.columns:
+                    kpi_value = result_df[kpi_col].iloc[0]
+                    print(f"[KPI計算] {kpi_col}の値: {kpi_value}")
+        return result_df
+    
+    def _detect_and_display_efforts(self):
+        """
+        エフォートを検出してテーブルに表示する。
+        
+        ルール:
+        - 0mを検出（起点0m）
+        - 起点0mから5秒前の区間にSB1があればstartとしてその時刻を、SB1がなくFPがあればその時刻をstartに設定。どちらもなければエフォートIDを採番しない
+        - 起点0m以降のFPをすべて取得。FPの間隔が30秒以上開く箇所を探し、その30秒以上開いたFPまでを同一エフォートデータとして保持
+        - これを0m毎に繰り返す
+        """
+        efforts = []  # 最初に初期化
+                
+        # 必要な列の存在確認
+        if "user_id" not in self.df_all.columns or "position" not in self.df_all.columns or "timestamp" not in self.df_all.columns:
+            self.effort_table.setRowCount(0)
+            self._efforts_data = []
+            return
+        
+        # 選手名の列を確認
+        has_first_name = "first_name" in self.df_all.columns
+        has_last_name = "last_name" in self.df_all.columns
+        
+        # Date列を確認
+        has_date = "Date" in self.df_all.columns
+        
+        # user_idが空欄のSB1データを取得（全選手で共有）
+        sb1_no_user = self.df_all[
+            (self.df_all["position"] == "SB1") & 
+            (self.df_all["user_id"].isna() | (self.df_all["user_id"] == ""))
+        ].copy()
+        
+        # 選手ごとにグループ化
+        for user_id, group in self.df_all.groupby("user_id"):
+            # user_idが空欄のグループはスキップ（SB1は後でマージする）
+            if pd.isna(user_id) or user_id == "":
+                continue
+            
+            # 選手名を取得
+            player_name = "Unknown"
+            if has_first_name or has_last_name:
+                first_row = group.iloc[0]
+                name_parts = []
+                if has_first_name and pd.notna(first_row.get("first_name")):
+                    name_parts.append(str(first_row["first_name"]))
+                if has_last_name and pd.notna(first_row.get("last_name")):
+                    name_parts.append(str(first_row["last_name"]))
+                if name_parts:
+                    player_name = " ".join(name_parts)
+            
+            print(f"[エフォート検出] 選手: {player_name} (user_id: {user_id})")
+            
+            # この選手のデータとuser_idが空欄のSB1データをマージ
+            group_with_sb1 = pd.concat([group, sb1_no_user], ignore_index=True)
+            
+            # 時系列でソート
+            group_sorted_all = group_with_sb1.sort_values("timestamp").reset_index(drop=True)
+            
+            # 0mの位置を持つ行を検出
+            zero_m_rows = group_sorted_all[group_sorted_all["position"] == "0m"].copy()
+            
+            if zero_m_rows.empty:
+                print(f"  [エフォート検出] 0mに値がある行がありません")
+                continue
+            
+            # 各0mについて独立にエフォートを検出
+            for idx in range(len(zero_m_rows)):
+                zero_m_row = zero_m_rows.iloc[idx]
+                zero_m_time = zero_m_row["timestamp"]  # 起点0m
+                
+                if pd.isna(zero_m_time):
+                    continue
+                
+                print(f"  [起点0m検出] 0m時刻: {zero_m_time}")
+                
+                # 起点0mから5秒前の区間にSB1またはFPがあるかチェック
+                start_time = None
+                start_type = None
+                
+                # 全データから、起点0mの5秒前から起点0mまでの範囲でSB1またはFPを探す
+                check_start_time = zero_m_time - pd.Timedelta(seconds=5)
+                
+                print(f"    [start検索] 検索範囲: {check_start_time} ～ {zero_m_time}")
+                
+                # 検索範囲内の行を取得
+                mask = (group_sorted_all["timestamp"] >= check_start_time) & (group_sorted_all["timestamp"] <= zero_m_time)
+                search_rows = group_sorted_all[mask]
+                
+                # SB1を優先して検索
+                sb1_rows = search_rows[search_rows["position"] == "SB1"]
+                if not sb1_rows.empty:
+                    start_time = sb1_rows.iloc[-1]["timestamp"]  # 最後のSB1（0mに最も近い）
+                    start_type = "SB1"
+                    print(f"    [start設定] SB1を検出: {start_time}")
+                else:
+                    # FPを検索
+                    fp_rows = search_rows[search_rows["position"] == "FP"]
+                    if not fp_rows.empty:
+                        start_time = fp_rows.iloc[-1]["timestamp"]  # 最後のFP（0mに最も近い）
+                        start_type = "FP"
+                        print(f"    [start設定] FPを検出: {start_time}")
+                
+                # startが設定されていない場合はエフォートIDを採番しない
+                if start_time is None:
+                    print(f"    [スキップ] startが見つかりません（エフォートIDを採番しません）")
+                    continue
+                
+                # startから30秒以内のFPを順に追跡
+                # 見つからなくなるまで繰り返し、最後のFPから30秒後までのデータをエフォートとして確定
+                current_time = start_time
+                last_fp_time = None
+                
+                # 起点0m以降のすべてのFPを時系列で取得
+                fp_rows_after = group_sorted_all[
+                    (group_sorted_all["timestamp"] > zero_m_time) & 
+                    (group_sorted_all["position"] == "FP")
+                ]
+                fps_after_zero_m = fp_rows_after["timestamp"].tolist()
+                
+                # startから30秒以内のFPを順に追跡
+                while True:
+                    # current_timeから30秒以内のFPを探す
+                    found_fp = None
+                    for fp_time in fps_after_zero_m:
+                        time_diff = (fp_time - current_time).total_seconds()
+                        if 0 < time_diff <= 30:
+                            found_fp = fp_time
+                            print(f"    [FP追跡] {current_time} → {found_fp}, 時間差: {time_diff:.2f}秒 (30秒以内)")
+                            break
+                    
+                    if found_fp is None:
+                        # 30秒以内のFPが見つからなかった
+                        if last_fp_time is None:
+                            # FPが1つも見つからなかった場合
+                            # startから30秒後までのデータを含める
+                            end_time = start_time + pd.Timedelta(seconds=30)
+                            print(f"    [エフォート確定] start時刻: {start_time}, FPが見つかりません。startから30秒後まで: {end_time}")
+                            
+                            # startから30秒後までの間にあるすべてのデータポイントを取得
+                            mask = (group_sorted_all["timestamp"] >= start_time) & (group_sorted_all["timestamp"] <= end_time)
+                            effort_data = group_sorted_all[mask].sort_values("timestamp")
+                            
+                            # 辞書形式に変換
+                            effort_data_points = effort_data.to_dict("records")
+                            
+                            print(f"    [データ取得] start: {start_time}, 終了時刻: {end_time}, データポイント数: {len(effort_data_points)}")
+                            
+                            start_date = zero_m_row.get("Date") if has_date else start_time
+                            efforts.append({
+                                "player_name": player_name,
+                                "date": start_date,
+                                "start_time": start_time,
+                                "start_type": start_type,
+                                "data_points": effort_data_points
+                            })
+                            break
+                        else:
+                            # 最後のFPから30秒後までのデータをエフォートとして確定
+                            end_time = last_fp_time + pd.Timedelta(seconds=30)
+                            print(f"    [エフォート確定] 最後のFP: {last_fp_time}, 終了時刻: {end_time} (最後のFPから30秒後)")
+                            
+                            # startからend_timeまでの間にあるすべてのデータポイントを取得
+                            mask = (group_sorted_all["timestamp"] >= start_time) & (group_sorted_all["timestamp"] <= end_time)
+                            effort_data = group_sorted_all[mask].sort_values("timestamp")
+                            
+                            # 辞書形式に変換
+                            effort_data_points = effort_data.to_dict("records")
+                            
+                            print(f"    [データ取得] start: {start_time}, 終了時刻: {end_time}, データポイント数: {len(effort_data_points)}")
+                            
+                            # エフォートを確定
+                            start_date = zero_m_row.get("Date") if has_date else start_time
+                            print(f"    [エフォート確定] start時刻: {start_time}, データポイント数: {len(effort_data_points)}")
+                            efforts.append({
+                                "player_name": player_name,
+                                "date": start_date,
+                                "start_time": start_time,
+                                "start_type": start_type,
+                                "data_points": effort_data_points
+                            })
+                            break
+                    else:
+                        # 見つかったFPを次のcurrent_timeとして設定
+                        last_fp_time = found_fp
+                        current_time = found_fp
+        
+        # エフォートごとにKPIを計算
+        print(f"[エフォート検出] 合計 {len(efforts)} 個のエフォートを検出しました")
+        print(f"[KPI計算] エフォートごとにKPIを計算します...")
+        
+        for effort_idx, effort in enumerate(efforts):
+            if not effort.get("data_points"):
+                continue
+            
+            # data_pointsをDataFrameに変換
+            effort_df = pd.DataFrame(effort["data_points"])
+            
+            if effort_df.empty:
+                continue
+            
+            # KPI列を計算
+            print(f"  [エフォート {effort_idx + 1}] KPI計算前のDataFrame列: {effort_df.columns.tolist()}")
+            effort_df_with_kpi = self._calculate_kpi_for_effort(effort_df)
+            print(f"  [エフォート {effort_idx + 1}] KPI計算後のDataFrame列: {effort_df_with_kpi.columns.tolist()}")
+            
+            # 計算したKPI列を含むdata_pointsに更新
+            effort["data_points"] = effort_df_with_kpi.to_dict("records")
+            
+            # 最初のレコードにKPI列が含まれているか確認
+            if effort["data_points"]:
+                first_record_keys = list(effort["data_points"][0].keys())
+                print(f"  [エフォート {effort_idx + 1}] data_points[0]のキー: {first_record_keys}")
+            
+            # KPI列のリストを取得してログ出力
+            kpi_cols = self._display_kpi_columns()
+            calculated_kpi_cols = [col for col in kpi_cols if col in effort_df_with_kpi.columns]
+            if calculated_kpi_cols:
+                print(f"  [エフォート {effort_idx + 1}] KPI列を計算しました: {', '.join(calculated_kpi_cols)}")
+            else:
+                print(f"  [エフォート {effort_idx + 1}] KPI列が計算されませんでした。期待されるKPI列: {kpi_cols}")
+        
+        # エフォートデータを保持
+        self._efforts_data = efforts.copy() if efforts else []
+        
+        # エフォートテーブルを更新
+        self._update_effort_table_display()
+    
+    def _update_effort_table_display(self):
+        """エフォートテーブルの表示を更新（モード変更時にも呼び出される）"""
+        if not hasattr(self, '_efforts_data') or not self._efforts_data:
+            self.effort_table.setRowCount(0)
+            return
+        
+        efforts = self._efforts_data
+        
+        # KPI列のリストを取得（現在のモードに基づく）
+        kpi_cols = self._display_kpi_columns()
+        print(f"[エフォートテーブル更新] KPI列数: {len(kpi_cols)}, KPI列名: {kpi_cols}")
+        
+        # エフォートテーブルの列数を設定: 選手名、日時、[KPI列...]、周回数
+        base_cols_before_kpi = 2  # 選手名、日時
+        base_cols_after_kpi = 1  # 周回数
+        total_cols = base_cols_before_kpi + len(kpi_cols) + base_cols_after_kpi
+        self.effort_table.setColumnCount(total_cols)
+        
+        # ヘッダーラベルを設定
+        headers = ["選手名", "日時"] + kpi_cols + ["周回数"]
+        self.effort_table.setHorizontalHeaderLabels(headers)
+        
+        # ヘッダーのリサイズモードを設定（下のテーブルと同じ仕様）
+        hh = self.effort_table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        
+        # 列幅を設定
+        default_width = 160
+        wider = {"選手名": 160, "日時": 180, "周回数": 80}
+        for i, header in enumerate(headers):
+            self.effort_table.setColumnWidth(i, wider.get(header, default_width))
+        
+        # エフォートテーブルを更新
+        print(f"[デバッグ] effortsの長さ: {len(efforts)}, _efforts_dataの長さ: {len(self._efforts_data)}")
+        self.effort_table.setRowCount(len(efforts))
+        for idx, effort in enumerate(efforts):
+            # 選手名
+            self.effort_table.setItem(idx, 0, QTableWidgetItem(str(effort["player_name"])))
+            
+            # 日時
+            date_str = ""
+            if effort["date"] is not None:
+                if isinstance(effort["date"], (pd.Timestamp, datetime.datetime)):
+                    date_str = effort["date"].strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    date_str = str(effort["date"])
+            self.effort_table.setItem(idx, 1, QTableWidgetItem(date_str))
+            
+            # KPI列の値を表示
+            if effort.get("data_points") and len(effort["data_points"]) > 0:
+                effort_df = pd.DataFrame(effort["data_points"])
+                print(f"  [エフォート {idx + 1}] DataFrame列: {effort_df.columns.tolist()}")
+                
+                for kpi_idx, kpi_col in enumerate(kpi_cols):
+                    col_idx = base_cols_before_kpi + kpi_idx
+                    
+                    if kpi_col in effort_df.columns:
+                        # KPI列の値を取得（エフォート全体で計算された値）
+                        kpi_values = pd.to_numeric(effort_df[kpi_col], errors='coerce')
+                        print(f"    [KPI列 {kpi_col}] 全値: {kpi_values.tolist()}")
+                        # NaN以外の値を取得（通常は1つの値のはず）
+                        valid_values = kpi_values.dropna()
+                        
+                        print(f"    [KPI列 {kpi_col}] 有効な値の数: {len(valid_values)}")
+                        
+                        if len(valid_values) > 0:
+                            # 最初の有効な値を使用（通常は1つだけ）
+                            kpi_value = valid_values.iloc[0]
+                            # 小数点以下3桁で表示
+                            kpi_str = f"{kpi_value:.3f}"
+                            print(f"    [KPI列 {kpi_col}] 表示値: {kpi_str}")
+                        else:
+                            kpi_str = ""
+                            print(f"    [KPI列 {kpi_col}] 値なし（NaN）")
+                        
+                        self.effort_table.setItem(idx, col_idx, QTableWidgetItem(kpi_str))
+                    else:
+                        print(f"    [KPI列 {kpi_col}] DataFrameに列が存在しません。利用可能な列: {effort_df.columns.tolist()}")
+                        self.effort_table.setItem(idx, col_idx, QTableWidgetItem(""))
+            
+            # 周回数（エフォート内の0mの回数をカウント）
+            lap_count = 0
+            if effort.get("data_points"):
+                # 生データではposition列で0mを判定
+                for point in effort["data_points"]:
+                    if point.get("position") == "0m":
+                        lap_count += 1
+            
+            lap_col_idx = base_cols_before_kpi + len(kpi_cols)
+            self.effort_table.setItem(idx, lap_col_idx, QTableWidgetItem(str(lap_count)))
 
     # ------------------------------------------------------------------
     # UIロジック
     # ------------------------------------------------------------------
     def _build_ui(self):
-        self.setWindowTitle("Display KPIs")
+        self.setWindowTitle("LapApp Ver2 - Display KPIs")
         self.resize(980, 640)
 
         main_layout = QVBoxLayout()
@@ -753,9 +1173,6 @@ class KPIPage(QWidget):
         # --- 上部バー（Show All, モード切替, Reload） ---
         top_row = QHBoxLayout()
 
-        self.debug_all_cols = QCheckBox("Show All Columns")
-        self.debug_all_cols.setChecked(False)
-        top_row.addWidget(self.debug_all_cols)
 
         self.mode_group = QButtonGroup(self)
         self.rb_roll = QRadioButton("Rolling")
@@ -789,38 +1206,27 @@ class KPIPage(QWidget):
 
         main_layout.addLayout(top_row)
 
-        # --- フィルタフォーム（1行だけ：KPI選択 + min/max） ---
-        self.filter_form = QFormLayout()
-        main_layout.addLayout(self.filter_form)
 
-        # --- テーブル ---
-        self.table = QTableView()
-        self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.setAlternatingRowColors(True)
+        # --- エフォートテーブル ---
+        effort_label = QLabel("Effort List")
+        main_layout.addWidget(effort_label)
+        
+        self.effort_table = QTableWidget(0, 5)
+        self.effort_table.setHorizontalHeaderLabels(["Player", "Date", "start", "end", "the number of laps"])
 
-        # 右クリックメニュー
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
-
-        # Ctrl/Cmd + C でコピー
-        copy_shortcut = QAction(self.table)
-        copy_shortcut.setShortcut(QKeySequence.Copy)
-        copy_shortcut.triggered.connect(self._copy_selected_rows_to_clipboard)
-        self.table.addAction(copy_shortcut)
-
-        main_layout.addWidget(self.table)
-
-        # --- 下部ボタン群 ---
-        btn_row_delete = QPushButton("Delete selected rows")
-        btn_export_csv = QPushButton("Export to CSV")
-        btn_row_delete.clicked.connect(self.delete_selected_rows)
-        btn_export_csv.clicked.connect(self.export_current_view_to_csv)
-
-        btn_box = QHBoxLayout()
-        btn_box.addWidget(btn_row_delete)
-        btn_box.addWidget(btn_export_csv)
-        main_layout.addLayout(btn_box)
+        hh = self.effort_table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.Interactive)
+        self.effort_table.setAlternatingRowColors(True)
+        self.effort_table.verticalHeader().setVisible(True)
+        self.effort_table.verticalHeader().setDefaultSectionSize(26)
+        self.effort_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.effort_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        main_layout.addWidget(self.effort_table)
+        
+        # 生データを確認ボタン
+        btn_view_raw_data = QPushButton("View Raw Data for Selected Effort")
+        btn_view_raw_data.clicked.connect(self._view_effort_raw_data)
+        main_layout.addWidget(btn_view_raw_data)
 
         # 戻るボタン
         back_btn = QPushButton("← Back to Main")
@@ -830,9 +1236,6 @@ class KPIPage(QWidget):
         self.setLayout(main_layout)
 
         # シグナル接続（UI→挙動）
-        self.debug_all_cols.stateChanged.connect(
-            lambda _s: self._rebuild_table(self.debug_all_cols.isChecked())
-        )
         self.rb_roll.toggled.connect(
             lambda checked: checked and self._on_mode_changed("rolling")
         )
@@ -843,232 +1246,6 @@ class KPIPage(QWidget):
             lambda checked: checked and self._on_mode_changed("flying")
         )
 
-    # ---- フィルタ UI ----
-    def _build_filters(self):
-        # 既存行をクリア
-        while self.filter_form.rowCount():
-            self.filter_form.removeRow(0)
-
-        self.filter_kpi_combo = None
-        self.filter_min_edit = None
-        self.filter_max_edit = None
-        self._filter_stats = {}
-        self._current_filter_col = None
-
-        numeric_cols = self._display_kpi_columns()
-        if not numeric_cols or self.df_all.empty:
-            label = QLabel("KPI Filter: 利用可能な数値KPIがありません")
-            self.filter_form.addRow(label)
-            return
-
-        # Q1, Q3 を計算
-        num_df = self.df_all[numeric_cols].apply(pd.to_numeric, errors="coerce")
-        q1 = num_df.quantile(0.25, numeric_only=True)
-        q3 = num_df.quantile(0.75, numeric_only=True)
-        for col in numeric_cols:
-            self._filter_stats[col] = (
-                float(q1[col]) if pd.notna(q1[col]) else None,
-                float(q3[col]) if pd.notna(q3[col]) else None,
-            )
-
-        row = QHBoxLayout()
-        combo = QComboBox()
-        combo.addItem("（No Filter）", userData=None)
-        for col in numeric_cols:
-            combo.addItem(col, userData=col)
-
-        min_edit = QLineEdit()
-        min_edit.setPlaceholderText("min（Fallback to first quartile if empty）")
-
-        max_edit = QLineEdit()
-        max_edit.setPlaceholderText("max（Fallback to third quartile if empty）")
-
-        row.addWidget(combo)
-        row.addWidget(min_edit)
-        row.addWidget(QLabel("〜"))
-        row.addWidget(max_edit)
-
-        self.filter_form.addRow("KPI Filter", row)
-
-        self.filter_kpi_combo = combo
-        self.filter_min_edit = min_edit
-        self.filter_max_edit = max_edit
-
-        combo.currentIndexChanged.connect(
-            lambda _i: self._on_filter_kpi_changed(combo.currentData())
-        )
-        min_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
-        max_edit.textChanged.connect(lambda _t: self._on_filter_value_changed())
-
-        # 初期状態（フィルタなし）
-        self._apply_filter_from_ui()
-
-    # ---- テーブル再構築 ----
-    def _rebuild_table(self, show_all: bool):
-        if self.df_all is None or self.df_all.empty:
-            self.model = DataFrameModel(pd.DataFrame())
-            self.proxy = RangeFilterProxy([])
-            self.proxy.setSourceModel(self.model)
-            self.table.setModel(self.proxy)
-            return
-
-        if "__row_id" not in self.df_all.columns:
-            self.df_all = self.df_all.copy()
-            self.df_all["__row_id"] = range(len(self.df_all))
-
-        df_current = self.df_all.copy()
-
-        if show_all:
-            all_cols = [
-                c for c in df_current.columns
-                if not (c.startswith("imputed__") or c == "__row_id")
-            ]
-
-            # すべてのモードのKPI列名を取得（別のモードのKPIを除外するため）
-            all_kpi_cols = set()
-            cfg = self._interval_config or {}
-            for mode, entries in cfg.items():
-                if not isinstance(entries, list):
-                    continue
-                for ent in entries:
-                    if not isinstance(ent, dict):
-                        continue
-                    start = ent.get("start")
-                    end = ent.get("end")
-                    if not start or not end:
-                        continue
-                    name = ent.get("name") or f"{start}-{end}"
-                    if name in self.df_all.columns:
-                        all_kpi_cols.add(name)
-
-            priority: list[str] = []
-            priority += [c for c in NAME_COLUMNS if c in all_cols]
-            priority += self._display_kpi_columns()  # 現在のモードのKPI列のみ
-
-            # extrasには元のデータ列のみを含める（KPI列は除外）
-            extras = [
-                c for c in all_cols 
-                if c not in priority and c not in all_kpi_cols
-            ]
-
-            seen = set()
-            cols: list[str] = []
-            for c in priority + extras:
-                if c not in seen:
-                    cols.append(c)
-                    seen.add(c)
-        else:
-            cols = NAME_COLUMNS + self._display_kpi_columns()
-            cols = [
-                c for c in cols
-                if c in df_current.columns and not (c.startswith("imputed__") or c == "__row_id")
-            ]
-            if not cols:
-                cols = [
-                    c for c in df_current.columns
-                    if not (c.startswith("imputed__") or c == "__row_id")
-                ]
-
-        df_view = df_current[cols].copy()
-
-        # 赤字用マスク
-        mask_view = None
-        flag_map = {c: f"imputed__{c}" for c in cols}
-        if any(fc in self.df_all.columns for fc in flag_map.values()):
-            mask_view = pd.DataFrame(False, index=df_view.index, columns=df_view.columns)
-            for c, fc in flag_map.items():
-                if fc in self.df_all.columns:
-                    mask_view[c] = (
-                        self.df_all[fc].astype(bool).reindex(df_view.index).values
-                    )
-
-        self.model = DataFrameModel(df_view, mask_view)
-        self.proxy = RangeFilterProxy(df_view.columns.tolist())
-        self.proxy.setSourceModel(self.model)
-        self.table.setModel(self.proxy)
-
-        # 見た目調整
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.Interactive)
-
-        default_width = 160
-        wider = {"first_name": 160, "last_name": 160}
-        visible_cols = list(self.model._df.columns)
-        for i, c in enumerate(visible_cols):
-            self.table.setColumnWidth(i, wider.get(c, default_width))
-        self.table.verticalHeader().setDefaultSectionSize(26)
-
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-        # フィルタ再適用
-        if hasattr(self, "_current_filter_col"):
-            self.proxy.set_filter_column(self._current_filter_col)
-            self._apply_filter_from_ui()
-
-    # ---- フィルタ挙動 ----
-    def _on_filter_kpi_changed(self, col_name: str | None):
-        self._current_filter_col = col_name
-        self._apply_filter_from_ui()
-
-    def _on_filter_value_changed(self):
-        self._apply_filter_from_ui()
-
-    def _apply_filter_from_ui(self):
-        if not hasattr(self, "proxy"):
-            return
-
-        col = self._current_filter_col
-        if not col:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        if not self.filter_min_edit or not self.filter_max_edit:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        tmin = self.filter_min_edit.text().strip()
-        tmax = self.filter_max_edit.text().strip()
-        q1, q3 = self._filter_stats.get(col, (None, None))
-
-        # ★ここがポイント：
-        # 両方空欄で、Q1/Q3が計算できているときは
-        # 実際にテキストボックスへQ1〜Q3を入れて見えるようにする
-        if tmin == "" and tmax == "" and (q1 is not None or q3 is not None):
-            self.filter_min_edit.blockSignals(True)
-            self.filter_max_edit.blockSignals(True)
-            if q1 is not None:
-                self.filter_min_edit.setText(f"{q1:.3f}")
-                tmin = self.filter_min_edit.text().strip()
-            if q3 is not None:
-                self.filter_max_edit.setText(f"{q3:.3f}")
-                tmax = self.filter_max_edit.text().strip()
-            self.filter_min_edit.blockSignals(False)
-            self.filter_max_edit.blockSignals(False)
-
-        def parse_or_default(text: str, default: float | None):
-            if text == "":
-                return default
-            try:
-                return float(text)
-            except Exception:
-                return default
-
-        vmin = parse_or_default(tmin, q1)
-        vmax = parse_or_default(tmax, q3)
-
-        # Q1, Q3 どちらも取れない場合はフィルタ無し扱い
-        if vmin is None and vmax is None:
-            self.proxy.set_filter_column(None)
-            self.proxy.set_range(None, None)
-            return
-
-        self.proxy.set_filter_column(col)
-        self.proxy.set_range(vmin, vmax)
-
-
     # ---- モード変更 ----
     def _on_mode_changed(self, mode: str):
         if mode == getattr(self, "time_mode", None):
@@ -1077,8 +1254,37 @@ class KPIPage(QWidget):
         self._settings.setdefault("ui", {})["time_mode"] = mode
         _save_json(SETTINGS_PATH, self._settings)
 
-        self._build_filters()
-        self._rebuild_table(self.debug_all_cols.isChecked())
+        # モード変更時はKPIを再計算してからテーブルを更新
+        if hasattr(self, '_efforts_data') and self._efforts_data:
+            print(f"[モード変更] モード: {mode}, エフォート数: {len(self._efforts_data)}")
+            print(f"[モード変更] KPIを再計算します...")
+            
+            for effort_idx, effort in enumerate(self._efforts_data):
+                if not effort.get("data_points"):
+                    continue
+                
+                # data_pointsをDataFrameに変換
+                effort_df = pd.DataFrame(effort["data_points"])
+                
+                if effort_df.empty:
+                    continue
+                
+                # KPI列を再計算（新しいモードに応じたKPI列が計算される）
+                effort_df_with_kpi = self._calculate_kpi_for_effort(effort_df)
+                
+                # 計算したKPI列を含むdata_pointsに更新
+                effort["data_points"] = effort_df_with_kpi.to_dict("records")
+                
+                # KPI列のリストを取得してログ出力
+                kpi_cols = self._display_kpi_columns()
+                calculated_kpi_cols = [col for col in kpi_cols if col in effort_df_with_kpi.columns]
+                if calculated_kpi_cols:
+                    print(f"  [エフォート {effort_idx + 1}] KPI列を再計算しました: {', '.join(calculated_kpi_cols)}")
+            
+            print(f"[モード変更] KPI再計算完了")
+
+        # エフォートテーブルも更新（KPI列が変わるため）
+        self._update_effort_table_display()
 
     # ---- 戻る ----
     def go_back(self):
@@ -1088,147 +1294,22 @@ class KPIPage(QWidget):
             sw.removeWidget(self)
         sw.setCurrentIndex(0)
 
-    # ---- 行削除 ----
-    def delete_selected_rows(self):
-        sel = self.table.selectionModel().selectedRows()
-        if not sel:
-            QMessageBox.information(self, "Delete", "Please select rows to delete")
-            return
-
-        if QMessageBox.question(
-            self,
-            "Delete Rows",
-            f"{len(sel)} rows will be deleted. Continue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        ) != QMessageBox.Yes:
-            return
-
-        source_rows = sorted({self.proxy.mapToSource(i).row() for i in sel})
-
-        if "__row_id" in self.df_all.columns:
-            row_ids = self.df_all.iloc[source_rows]["__row_id"].tolist()
-            self.df_all.drop(
-                self.df_all.index[self.df_all["__row_id"].isin(row_ids)], inplace=True
-            )
-        else:
-            self.df_all.drop(self.df_all.index[source_rows], inplace=True)
-
-        self.df_all.reset_index(drop=True, inplace=True)
-        self._rebuild_table(self.debug_all_cols.isChecked())
-
-    # ---- CSVエクスポート ----
-    def export_current_view_to_csv(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save CSV", "kpi_export.csv", "CSV Files (*.csv)"
-        )
-        if not path:
-            return
-
-        rows = [
-            self.proxy.mapToSource(self.proxy.index(r, 0)).row()
-            for r in range(self.proxy.rowCount())
-        ]
-        export_df = self.df_all.iloc[rows].copy()
-
-        drop_cols = [
-            c for c in export_df.columns if c.startswith("imputed__")
-        ] + ["__row_id"]
-        export_df.drop(
-            columns=[c for c in drop_cols if c in export_df.columns],
-            inplace=True,
-            errors="ignore",
-        )
-
-        try:
-            export_df.to_csv(path, index=False, encoding="utf-8-sig")
-            QMessageBox.information(self, "Export", f"CSV Saved:\n{path}")
-        except Exception as e:
-            QMessageBox.warning(self, "Export Failed", f"Save failed:\n{e}")
-
-    # ---- 右クリックメニュー / クリップボードコピー ----
-    def _on_table_context_menu(self, pos: QPoint):
-        tv = self.table
-        idx = tv.indexAt(pos)
-        sel = tv.selectionModel()
-
-        if idx.isValid() and not sel.isSelected(idx):
-            tv.selectRow(idx.row())
-
-        menu = QMenu(tv)
-        act_copy = QAction("選択行をコピー（TSV）", menu)
-        act_copy.triggered.connect(self._copy_selected_rows_to_clipboard)
-        menu.addAction(act_copy)
-        menu.exec_(tv.viewport().mapToGlobal(pos))
-
-    def _copy_selected_rows_to_clipboard(self):
-        tv = self.table
-        model = tv.model()
-        sel = tv.selectionModel()
-        if not sel or not sel.hasSelection():
-            return
-
-        visible_cols = []
-        headers = []
-        for c in range(model.columnCount()):
-            if not tv.isColumnHidden(c):
-                visible_cols.append(c)
-                hdr = model.headerData(c, Qt.Horizontal)
-                headers.append("" if hdr is None else str(hdr))
-
-        rows = sorted({i.row() for i in sel.selectedIndexes()})
-        if not rows:
-            rows = sorted(i.row() for i in sel.selectedRows())
-
-        lines = ["\t".join(headers)]
-        for r in rows:
-            vals = []
-            for c in visible_cols:
-                idx = model.index(r, c)
-                text = model.data(idx, Qt.DisplayRole)
-                vals.append("" if text is None else str(text))
-            lines.append("\t".join(vals))
-
-        tsv = "\n".join(lines)
-        QGuiApplication.clipboard().setText(tsv)
-        print(f"[KPI] {len(rows)} 行をクリップボードへコピーしました")
-
     # ---- リロード ----
     def _reload_kpi(self):
         print("[KPI] リロード開始")
 
-        # 現在のソートを覚えておく
-        hh = self.table.horizontalHeader()
-        sort_col = hh.sortIndicatorSection()
-        sort_ord = hh.sortIndicatorOrder()
-
         # データを再読込
-        self._load_data_and_prepare_kpi()
+        self._load_data()
 
-        # フィルタはモードに合わせて作り直し
-        self._build_filters()
-        self._rebuild_table(self.debug_all_cols.isChecked())
-
-        # ソート復元
-        try:
-            self.table.sortByColumn(sort_col, sort_ord)
-        except Exception:
-            pass
+        # エフォート検出とテーブル更新
+        self._detect_and_display_efforts()
 
         print("[KPI] リロード完了")
 
     def _reload_kpi_json(self):
         print("[KPI] kpi.json リロード開始")
 
-        # kpi.json を読み直し
-        self._interval_config = _load_kpi_intervals(KPI_INTERVALS_PATH)
-
-        # 新しい定義に基づいて区間列を追加（既にある列はスキップされる）
-        self._ensure_interval_columns()
-
-        # フィルタとテーブルを作り直し
-        self._build_filters()
-        self._rebuild_table(self.debug_all_cols.isChecked())
+        # KPI計算はエフォートごとに行うため、ここでは不要
 
         print("[KPI] kpi.json リロード完了")
 
@@ -1237,3 +1318,35 @@ class KPIPage(QWidget):
         editor = KPIJsonEditorPage(self)
         self.stacked_widget.addWidget(editor)
         self.stacked_widget.setCurrentWidget(editor)
+    
+    def _view_effort_raw_data(self):
+        """選択されたエフォートの生データを表示"""
+        selected_rows = self.effort_table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.information(self, "選択エラー", "エフォートを選択してください")
+            return
+        
+        row_idx = selected_rows[0].row()
+        
+        # デバッグ情報を出力
+        efforts_data_len = len(getattr(self, '_efforts_data', []))
+        table_row_count = self.effort_table.rowCount()
+        print(f"[デバッグ] 選択された行: {row_idx}, テーブル行数: {table_row_count}, _efforts_dataの長さ: {efforts_data_len}")
+        
+        if not hasattr(self, '_efforts_data') or not self._efforts_data:
+            QMessageBox.warning(self, "エラー", "エフォートデータが読み込まれていません")
+            return
+        
+        if row_idx < 0 or row_idx >= len(self._efforts_data):
+            QMessageBox.warning(
+                self, 
+                "エラー", 
+                f"無効な行が選択されています\n行: {row_idx}\nデータ数: {len(self._efforts_data)}\nテーブル行数: {table_row_count}"
+            )
+            return
+        
+        effort_data = self._efforts_data[row_idx]
+        
+        # エフォート生データダイアログを別ウィンドウで開く（モーダルレス）
+        raw_data_dialog = EffortRawDataPage(self, effort_data)
+        raw_data_dialog.show()

@@ -83,6 +83,10 @@ class LicenseDialog(QDialog):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
+    # アプリケーション名を設定（タスクバーなどに表示される）
+    app.setApplicationName("LapApp Ver2")
+    app.setApplicationDisplayName("LapApp Ver2")
+    
     SETTINGS_PATH = os.path.join(os.getcwd(), "settings.json")
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:

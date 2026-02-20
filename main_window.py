@@ -34,7 +34,7 @@ class MainWindow(QWidget):
         self.start_datetime = QDateTimeEdit()
         self.end_datetime = QDateTimeEdit()
 
-        self.setWindowTitle("Lap Time Visualizer")
+        self.setWindowTitle("LapApp Ver2")
         self.resize(1200, 800)
         
         # 設定ロード＆初期値適用
