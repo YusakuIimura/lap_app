@@ -1,7 +1,7 @@
 # main_window.py
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QDateEdit, QPushButton,
-    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit,QAbstractItemView
+    QCheckBox, QListWidget, QListWidgetItem, QHBoxLayout, QMessageBox, QDateTimeEdit,QAbstractItemView, QFileDialog
 )
 from PyQt5.QtCore import QDateTime
 from kpi_page import KPIPage
@@ -72,6 +72,10 @@ class MainWindow(QWidget):
         self.kpi_btn = QPushButton("Show KPIs") 
         self.kpi_btn.clicked.connect(self.show_kpi)
         self.layout.addWidget(self.kpi_btn)
+        
+        # self.kpi_local_btn = QPushButton("Show KPIs from Local CSV") 
+        # self.kpi_local_btn.clicked.connect(self.show_kpi_by_localfile)
+        # self.layout.addWidget(self.kpi_local_btn)
 
         self.setLayout(self.layout)
         
@@ -95,7 +99,18 @@ class MainWindow(QWidget):
         """
         print("[Players] クエリ送信中…")
         t0 = time.perf_counter()
-        df = get_df_from_db(query)
+        try:
+            df = get_df_from_db(query)
+        except Exception as e:
+            t1 = time.perf_counter()
+            print(f"[Players] クエリエラー: {e} / {t1 - t0:.2f}s")
+            QMessageBox.warning(
+                self,
+                "Query Error",
+                f"Failed to execute query.\n\nError: {str(e)}\n\nPlease check your database connection and query syntax."
+            )
+            return
+        
         t1 = time.perf_counter()
         print(f"[Players] 取得完了: {len(df)} 行 / {t1 - t0:.2f}s")
         
@@ -155,6 +170,31 @@ class MainWindow(QWidget):
 
         # ページ遷移
         kpi_page = KPIPage(query, self.stacked_widget, selected_ids)
+        self.stacked_widget.addWidget(kpi_page)
+        self.stacked_widget.setCurrentWidget(kpi_page)
+    
+    def show_kpi_by_localfile(self):
+        """ローカルCSVファイルからKPIページを表示"""
+        # CSVファイル選択ダイアログ
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select CSV File",
+            "",
+            "CSV Files (*.csv)"
+        )
+        
+        if not file_path:
+            return
+        
+        # CSVファイルパスを直接KPIPageに渡す
+        # KPIPageがCSVファイルパスかどうかを判定して_load_data_by_csvを呼び出す
+        query = file_path
+        
+        # user_idsは空リスト（CSVから読み込む場合は不要）
+        user_ids = []
+        
+        # ページ遷移
+        kpi_page = KPIPage(query, self.stacked_widget, user_ids)
         self.stacked_widget.addWidget(kpi_page)
         self.stacked_widget.setCurrentWidget(kpi_page)
 

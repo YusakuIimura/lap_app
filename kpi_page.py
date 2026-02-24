@@ -38,7 +38,7 @@ TRACK_ORDER = [
     "200m",
 ]
 # 名前系は常に先頭に出したい列
-NAME_COLUMNS = ["first_name", "last_name", "Date", "FP_start"]
+NAME_COLUMNS = ["first_name", "last_name", "Date", "FP"]
 
 
 def _load_json(path: str):
@@ -203,24 +203,8 @@ class KPIJsonEditorPage(QWidget):
         for key in ("rolling", "standing", "flying"):
             self._config.setdefault(key, [])
 
-        # start/end で選べる地点（df_all にある列だけを採用）
-        # TRACK_ORDERの列名を実際のデータフレームの列名にマッピング
-        # 0m_start -> 0m, FP_start -> FP など
-        track_order_mapping = {
-            "FP_start": "FP",
-            "0m_start": "0m",
-            "FP_2nd": "FP",
-            "0m_2nd": "0m",
-        }
-        
-        self.available_points = []
-        for p in TRACK_ORDER:
-            # マッピングがあればそれを使用、なければそのまま
-            actual_col = track_order_mapping.get(p, p)
-            if actual_col in kpi_page.df_all.columns:
-                # 重複を避ける
-                if actual_col not in self.available_points:
-                    self.available_points.append(actual_col)
+        # start/end で選べる地点（TRACK_ORDERをそのまま使用）
+        self.available_points = list(TRACK_ORDER)
 
         self._build_ui()
         self._refresh_mode_entries()
@@ -274,6 +258,11 @@ class KPIJsonEditorPage(QWidget):
         self.end_combo = QComboBox()
         self.end_combo.addItems(self.available_points)
         
+        # startのオフセット用ドロップダウン（次の周回、次の次の周回など）
+        self.start_offset_combo = QComboBox()
+        for i in range(11):  # 0から10まで
+            self.start_offset_combo.addItem(str(i), userData=i)
+        
         # endのオフセット用ドロップダウン（次の周回、次の次の周回など）
         self.end_offset_combo = QComboBox()
         for i in range(11):  # 0から10まで
@@ -284,6 +273,8 @@ class KPIJsonEditorPage(QWidget):
 
         add_row.addWidget(QLabel("start:"))
         add_row.addWidget(self.start_combo)
+        add_row.addWidget(QLabel("start offset:"))
+        add_row.addWidget(self.start_offset_combo)
         add_row.addWidget(QLabel("end:"))
         add_row.addWidget(self.end_combo)
         add_row.addWidget(QLabel("end offset:"))
@@ -298,7 +289,7 @@ class KPIJsonEditorPage(QWidget):
         main.addLayout(add_row)
         
         # Usage comment
-        comment_label = QLabel("Note: end offset specifies which lap to use. Example: end=0m, offset=1 → next lap's 0m")
+        comment_label = QLabel("Note: offset specifies which lap to use. Example: start=0m, offset=1 → next lap's 0m")
         comment_label.setWordWrap(True)
         comment_label.setStyleSheet("color: gray; font-size: 10pt;")
         main.addWidget(comment_label)
@@ -350,14 +341,21 @@ class KPIJsonEditorPage(QWidget):
     # ------------------------------------------------------------------
     def _on_add_clicked(self):
         mode = self._current_mode()
-        start = self.start_combo.currentText()
+        start_base = self.start_combo.currentText()
+        start_offset = self.start_offset_combo.currentData()
         end_base = self.end_combo.currentText()
         end_offset = self.end_offset_combo.currentData()
         name = self.name_edit.text().strip()
 
-        if not start or not end_base:
+        if not start_base or not end_base:
             QMessageBox.warning(self, "Cannot add.", "Please select both start and end.")
             return
+
+        # startにオフセットを追加（+0の場合は省略）
+        if start_offset and start_offset > 0:
+            start = f"{start_base}+{start_offset}"
+        else:
+            start = start_base
 
         # endにオフセットを追加（+0の場合は省略）
         if end_offset and end_offset > 0:
@@ -371,6 +369,7 @@ class KPIJsonEditorPage(QWidget):
 
         self._config.setdefault(mode, []).append(entry)
         self.name_edit.clear()
+        self.start_offset_combo.setCurrentIndex(0)  # オフセットをリセット
         self.end_offset_combo.setCurrentIndex(0)  # オフセットをリセット
         self._refresh_mode_entries()
 
@@ -439,12 +438,12 @@ class EffortRawDataPage(QDialog):
         self._build_ui()
     
     def _build_ui(self):
-        self.setWindowTitle("エフォート生データ")
+        self.setWindowTitle("Effort Raw Data")
         self.setMinimumSize(1000, 600)
         main_layout = QVBoxLayout()
         
         # タイトル
-        title = QLabel(f"エフォート生データ - {self.effort_data.get('player_name', 'Unknown')}")
+        title = QLabel(f"Effort Raw Data - {self.effort_data.get('player_name', 'Unknown')}")
         title.setStyleSheet("font-size: 14pt; font-weight: bold;")
         main_layout.addWidget(title)
         
@@ -473,7 +472,7 @@ class EffortRawDataPage(QDialog):
         button_layout.addStretch()
         
         # 閉じるボタン
-        close_btn = QPushButton("閉じる")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         button_layout.addWidget(close_btn)
         
@@ -485,7 +484,7 @@ class EffortRawDataPage(QDialog):
         self._load_data()
     
     def _load_data(self):
-        """エフォートの生データをテーブルに表示"""
+        """エフォートの生データをテーブルに表示（TRACK_ORDERを列名としてtimestampを格納）"""
         if not self.effort_data.get("data_points"):
             self.model = DataFrameModel(pd.DataFrame())
             self.table.setModel(self.model)
@@ -501,11 +500,65 @@ class EffortRawDataPage(QDialog):
             return
         
         # timestamp順にソート
-        if "timestamp" in df.columns:
-            df = df.sort_values("timestamp").reset_index(drop=True)
+        if "timestamp" not in df.columns or "position" not in df.columns:
+            self.model = DataFrameModel(pd.DataFrame())
+            self.table.setModel(self.model)
+            return
         
-        # すべての列を表示（エフォートとして検出されたデータをそのまま表示）
-        df_view = df.copy()
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        
+        # TRACK_ORDERを列名として、各位置のtimestampを格納する形式に変換
+        # 各周回ごとに1行を作成（0mの出現回数で周回を識別）
+        zero_m_rows = df[df["position"] == "0m"].copy()
+        
+        if zero_m_rows.empty:
+            # 0mがない場合は、全データを1周回として扱う
+            rows_data = []
+            row_dict = {}
+            for pos in TRACK_ORDER:
+                pos_rows = df[df["position"] == pos]
+                if not pos_rows.empty:
+                    row_dict[pos] = pos_rows.iloc[0]["timestamp"]
+                else:
+                    row_dict[pos] = None
+            rows_data.append(row_dict)
+            df_view = pd.DataFrame(rows_data)
+        else:
+            # 各0mの間を1周回として扱う
+            rows_data = []
+            
+            for i in range(len(zero_m_rows)):
+                # この周回の開始時刻（前の0m、またはエフォート開始時刻）
+                if i == 0:
+                    lap_start_time = df.iloc[0]["timestamp"]
+                else:
+                    lap_start_time = zero_m_rows.iloc[i-1]["timestamp"]
+                
+                # この周回の終了時刻（この0m）
+                lap_end_time = zero_m_rows.iloc[i]["timestamp"]
+                
+                # この周回のデータを取得
+                lap_df = df[
+                    (df["timestamp"] >= lap_start_time) & 
+                    (df["timestamp"] <= lap_end_time)
+                ].copy()
+                
+                # 各位置のtimestampを抽出
+                row_dict = {}
+                for pos in TRACK_ORDER:
+                    pos_rows = lap_df[lap_df["position"] == pos]
+                    if not pos_rows.empty:
+                        # 最初のtimestampを使用
+                        row_dict[pos] = pos_rows.iloc[0]["timestamp"]
+                    else:
+                        row_dict[pos] = None
+                
+                rows_data.append(row_dict)
+            
+            df_view = pd.DataFrame(rows_data)
+        
+        # 列の順序をTRACK_ORDERに合わせる
+        df_view = df_view[TRACK_ORDER]
         
         self.model = DataFrameModel(df_view)
         self.table.setModel(self.model)
@@ -515,10 +568,9 @@ class EffortRawDataPage(QDialog):
         hh.setSectionResizeMode(QHeaderView.Interactive)
         
         default_width = 160
-        wider = {"first_name": 160, "last_name": 160}
         visible_cols = list(self.model._df.columns)
         for i, c in enumerate(visible_cols):
-            self.table.setColumnWidth(i, wider.get(c, default_width))
+            self.table.setColumnWidth(i, default_width)
         self.table.verticalHeader().setDefaultSectionSize(26)
         
         self.table.setSelectionBehavior(QTableView.SelectRows)
@@ -527,7 +579,7 @@ class EffortRawDataPage(QDialog):
     def _save_to_csv(self):
         """エフォートの生データをCSVファイルに保存"""
         if not hasattr(self, 'model') or self.model._df.empty:
-            QMessageBox.warning(self, "エラー", "保存するデータがありません")
+            QMessageBox.warning(self, "Error", "No data to save")
             return
         
         # ファイル保存ダイアログ
@@ -555,9 +607,9 @@ class EffortRawDataPage(QDialog):
         try:
             # DataFrameをCSVに保存
             self.model._df.to_csv(path, index=False, encoding="utf-8-sig")
-            QMessageBox.information(self, "保存完了", f"CSVファイルを保存しました:\n{path}")
+            QMessageBox.information(self, "Save Complete", f"CSV file saved:\n{path}")
         except Exception as e:
-            QMessageBox.warning(self, "保存エラー", f"CSVファイルの保存に失敗しました:\n{e}")
+            QMessageBox.warning(self, "Save Error", f"Failed to save CSV file:\n{e}")
     
 class KPIPage(QWidget):
     """
@@ -593,7 +645,6 @@ class KPIPage(QWidget):
             import sys
             sys.exit(1)
         
-        print(f"[KPI設定読み込み] バージョン: {config_version}, モード: {[k for k in self._interval_config.keys() if k != 'version']}")
 
 
         # time_mode 初期値
@@ -609,7 +660,12 @@ class KPIPage(QWidget):
 
         # データ読み込み（Data ロジック）
         self.df_all = pd.DataFrame()
-        self._load_data()
+        # CSVファイルパスの場合は_load_data_by_csv、それ以外は_load_data
+        if isinstance(self._base_query, str) and (self._base_query.endswith('.csv') or self._base_query.startswith('CSV_FILE:')):
+            csv_path = self._base_query.replace('CSV_FILE:', '') if self._base_query.startswith('CSV_FILE:') else self._base_query
+            self._load_data_by_csv(csv_path)
+        else:
+            self._load_data()
 
         # UI 構築（UI ロジック）
         self._build_ui()
@@ -633,7 +689,6 @@ class KPIPage(QWidget):
     # ------------------------------------------------------------------
     def _load_data(self):
         """DB から生データを取得する（シンプル版）"""
-        print("[データ読み込み] DB問い合わせ中…")
         df = get_df_from_db(self._base_query)
 
         if df.empty:
@@ -658,11 +713,76 @@ class KPIPage(QWidget):
         # 時系列でソート
         self.df_all = df.sort_values("timestamp").reset_index(drop=True)
         
-        print(f"[データ読み込み] 生データ: {len(self.df_all)}行")
-        if not self.df_all.empty:
-            print(f"[データ読み込み] 列: {self.df_all.columns.tolist()}")
-            print(f"[データ読み込み] 最初の5行:")
-            print(self.df_all.head())
+        print(f"[データ読み込み] 完了: {len(self.df_all)}行")
+    
+    def _load_data_by_csv(self, csv_path: str):
+        """CSVファイルから生データを取得する"""
+        print(f"[CSV読み込み] ファイル: {csv_path}")
+        
+        # 複数のエンコーディングを試す
+        encodings = ["utf-8-sig", "utf-8", "shift_jis", "cp932", "euc-jp"]
+        df = None
+        last_error = None
+        
+        for encoding in encodings:
+            try:
+                df = pd.read_csv(csv_path, encoding=encoding)
+                break
+            except UnicodeDecodeError as e:
+                last_error = e
+                continue
+            except Exception as e:
+                last_error = e
+                continue
+        
+        if df is None:
+            error_msg = f"CSVファイルの読み込みに失敗しました: {csv_path}\nすべてのエンコーディングで読み込みに失敗しました。"
+            if last_error:
+                error_msg += f"\n最後のエラー: {last_error}"
+            QMessageBox.warning(
+                self,
+                "CSV読み込みエラー",
+                error_msg
+            )
+            self.go_back()
+            return
+        
+        if df.empty:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "CSVファイルにデータが含まれていません。\nReturning to the previous page."
+            )
+            self.go_back()
+            return
+        
+        # タイムスタンプをJST（naive）へ変換
+        # CSVの場合は既にJSTの可能性があるので、datetime型に変換してから処理
+        if "timestamp" in df.columns:
+            # 文字列の場合はdatetimeに変換
+            if df["timestamp"].dtype == 'object':
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors='coerce')
+            else:
+                # 既にdatetime型の場合も確実にdatetime型にする
+                df["timestamp"] = pd.to_datetime(df["timestamp"], errors='coerce')
+            
+            # タイムゾーン情報がある場合はJSTに変換
+            # pandasのDatetimeTZDtypeをチェック
+            if hasattr(df["timestamp"].dtype, 'tz') and df["timestamp"].dtype.tz is not None:
+                df["timestamp"] = to_jst_naive(df["timestamp"])
+            # タイムゾーン情報がない場合はそのまま（既にJSTと仮定）
+        
+        # デコーダ→地点名
+        if "decoder_id" in df.columns:
+            df["position"] = df["decoder_id"].map(translate_dict).fillna("Unknown")
+        elif "position" not in df.columns:
+            # position列がない場合はUnknownを設定
+            df["position"] = "Unknown"
+        
+        # 時系列でソート
+        self.df_all = df.sort_values("timestamp").reset_index(drop=True)
+        
+        print(f"[CSV読み込み] 完了: {len(self.df_all)}行")
         
 
     def _display_kpi_columns(self) -> list[str]:
@@ -676,30 +796,22 @@ class KPIPage(QWidget):
         mode = (self.time_mode or "rolling").lower()
         cfg = self._interval_config or {}
         entries = cfg.get(mode, [])
-        
-        print(f"[KPI列取得] モード: {mode}, エントリ数: {len(entries)}")
 
         cols: list[str] = []
         for ent_idx, ent in enumerate(entries):
             if not isinstance(ent, dict):
-                print(f"  [エントリ {ent_idx + 1}] 辞書型ではありません: {ent}")
                 continue
             start = ent.get("start")
             end = ent.get("end")
             name = ent.get("name")
             
-            print(f"  [エントリ {ent_idx + 1}] start={start}, end={end}, name={name}")
-            
             if not start or not end:
-                print(f"  [エントリ {ent_idx + 1}] startまたはendが無効のためスキップ")
                 continue
             
             # nameがあればname、なければ "start-end" を使用
             col_name = name if name else f"{start}-{end}"
             cols.append(col_name)
-            print(f"  [エントリ {ent_idx + 1}] KPI列名: {col_name}")
 
-        print(f"[KPI列取得] 最終的なKPI列: {cols}")
         return cols
 
     # ------------------------------------------------------------------
@@ -751,35 +863,24 @@ class KPIPage(QWidget):
         def find_position_timestamp(position_name, offset=0):
             """指定された位置のtimestampを取得（offsetでn個後の位置を指定）"""
             matching_rows = result_df[result_df["position"] == position_name]
-            print(f"      [位置検索] 位置名: {position_name}, オフセット: {offset}, マッチ数: {len(matching_rows)}")
             if matching_rows.empty:
-                print(f"      [位置検索] 位置 '{position_name}' が見つかりません")
                 return None
             
             idx = offset
             if idx < len(matching_rows):
                 timestamp = matching_rows.iloc[idx]["timestamp"]
-                print(f"      [位置検索] 見つかったtimestamp: {timestamp} (インデックス: {idx})")
                 return timestamp
-            print(f"      [位置検索] オフセット {offset} が範囲外です（最大: {len(matching_rows) - 1}）")
             return None
-        
-        print(f"[KPI計算開始] エフォートデータ: {len(result_df)}行, モード: {mode}, KPI定義数: {len(entries)}")
-        print(f"[KPI計算開始] 利用可能な位置: {result_df['position'].unique().tolist()}")
         
         for ent_idx, ent in enumerate(entries):
             if not isinstance(ent, dict):
-                print(f"  [KPI {ent_idx + 1}] エントリが辞書型ではありません: {ent}")
                 continue
                 
             start_str = ent.get("start")
             end_str = ent.get("end")
             name_str = ent.get("name")
             
-            print(f"  [KPI {ent_idx + 1}] エントリ内容: start={start_str}, end={end_str}, name={name_str}")
-            
             if not start_str or not end_str:
-                print(f"  [KPI {ent_idx + 1}] startまたはendが無効: start={start_str}, end={end_str}")
                 continue
             
             # 位置名とオフセットを解析
@@ -788,28 +889,17 @@ class KPIPage(QWidget):
             
             # 列名はnameを使用（nameがなければ "start-end"）
             col_name = name_str if name_str else f"{start_str}-{end_str}"
-            print(f"  [KPI {ent_idx + 1}] KPI列名: {col_name}")
-            print(f"  [KPI {ent_idx + 1}] start解析: 位置={start_pos}, オフセット={start_offset}")
-            print(f"  [KPI {ent_idx + 1}] end解析: 位置={end_pos}, オフセット={end_offset}")
             
             # すでに列があるなら再計算しない
             if col_name in result_df.columns:
-                print(f"    [KPI {ent_idx + 1}] 既に列が存在するためスキップ")
                 continue
             
             # 開始位置と終了位置のtimestampを取得
             start_time = find_position_timestamp(start_pos, start_offset)
             end_time = find_position_timestamp(end_pos, end_offset)
             
-            print(f"    [KPI {ent_idx + 1}] start_time={start_time}, end_time={end_time}")
-            
             # 該当するデータがなければNaN
             if start_time is None or end_time is None:
-                if start_time is None:
-                    print(f"    [KPI {ent_idx + 1}] start位置 '{start_pos}' (オフセット={start_offset}) が見つかりません")
-                if end_time is None:
-                    print(f"    [KPI {ent_idx + 1}] end位置 '{end_pos}' (オフセット={end_offset}) が見つかりません")
-                print(f"    [KPI {ent_idx + 1}] データが見つからないためNaNを設定")
                 result_df[col_name] = math.nan
                 continue
             
@@ -817,30 +907,12 @@ class KPIPage(QWidget):
             try:
                 time_diff = (end_time - start_time).total_seconds()
                 kpi_value = round(time_diff, 3)
-                print(f"    [KPI {ent_idx + 1}] 計算結果: {kpi_value}秒 (start={start_time}, end={end_time})")
                 # すべての行に同じ値を設定
                 result_df[col_name] = kpi_value
-                print(f"    [KPI {ent_idx + 1}] 列 '{col_name}' に値 {kpi_value} を設定しました")
-                # 設定後の値を確認
-                if col_name in result_df.columns:
-                    actual_value = result_df[col_name].iloc[0]
-                    print(f"    [KPI {ent_idx + 1}] 設定後の確認: 最初の行の値 = {actual_value}")
             except Exception as e:
-                print(f"    [KPI {ent_idx + 1}] 計算エラー: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[KPI計算エラー] {col_name}: {e}")
                 result_df[col_name] = math.nan
         
-        print(f"[KPI計算] 計算後の列: {result_df.columns.tolist()}")
-        print(f"[KPI計算] 計算後の行数: {len(result_df)}")
-        if not result_df.empty:
-            print(f"[KPI計算] 最初の行の列名: {list(result_df.iloc[0].index)}")
-            # KPI列の値を確認
-            kpi_cols = self._display_kpi_columns()
-            for kpi_col in kpi_cols:
-                if kpi_col in result_df.columns:
-                    kpi_value = result_df[kpi_col].iloc[0]
-                    print(f"[KPI計算] {kpi_col}の値: {kpi_value}")
         return result_df
     
     def _detect_and_display_efforts(self):
@@ -892,7 +964,6 @@ class KPIPage(QWidget):
                 if name_parts:
                     player_name = " ".join(name_parts)
             
-            print(f"[エフォート検出] 選手: {player_name} (user_id: {user_id})")
             
             # この選手のデータとuser_idが空欄のSB1データをマージ
             group_with_sb1 = pd.concat([group, sb1_no_user], ignore_index=True)
@@ -904,7 +975,6 @@ class KPIPage(QWidget):
             zero_m_rows = group_sorted_all[group_sorted_all["position"] == "0m"].copy()
             
             if zero_m_rows.empty:
-                print(f"  [エフォート検出] 0mに値がある行がありません")
                 continue
             
             # 各0mについて独立にエフォートを検出
@@ -915,16 +985,12 @@ class KPIPage(QWidget):
                 if pd.isna(zero_m_time):
                     continue
                 
-                print(f"  [起点0m検出] 0m時刻: {zero_m_time}")
-                
                 # 起点0mから5秒前の区間にSB1またはFPがあるかチェック
                 start_time = None
                 start_type = None
                 
                 # 全データから、起点0mの5秒前から起点0mまでの範囲でSB1またはFPを探す
                 check_start_time = zero_m_time - pd.Timedelta(seconds=5)
-                
-                print(f"    [start検索] 検索範囲: {check_start_time} ～ {zero_m_time}")
                 
                 # 検索範囲内の行を取得
                 mask = (group_sorted_all["timestamp"] >= check_start_time) & (group_sorted_all["timestamp"] <= zero_m_time)
@@ -935,18 +1001,15 @@ class KPIPage(QWidget):
                 if not sb1_rows.empty:
                     start_time = sb1_rows.iloc[-1]["timestamp"]  # 最後のSB1（0mに最も近い）
                     start_type = "SB1"
-                    print(f"    [start設定] SB1を検出: {start_time}")
                 else:
                     # FPを検索
                     fp_rows = search_rows[search_rows["position"] == "FP"]
                     if not fp_rows.empty:
                         start_time = fp_rows.iloc[-1]["timestamp"]  # 最後のFP（0mに最も近い）
                         start_type = "FP"
-                        print(f"    [start設定] FPを検出: {start_time}")
                 
                 # startが設定されていない場合はエフォートIDを採番しない
                 if start_time is None:
-                    print(f"    [スキップ] startが見つかりません（エフォートIDを採番しません）")
                     continue
                 
                 # startから30秒以内のFPを順に追跡
@@ -969,7 +1032,6 @@ class KPIPage(QWidget):
                         time_diff = (fp_time - current_time).total_seconds()
                         if 0 < time_diff <= 30:
                             found_fp = fp_time
-                            print(f"    [FP追跡] {current_time} → {found_fp}, 時間差: {time_diff:.2f}秒 (30秒以内)")
                             break
                     
                     if found_fp is None:
@@ -978,7 +1040,6 @@ class KPIPage(QWidget):
                             # FPが1つも見つからなかった場合
                             # startから30秒後までのデータを含める
                             end_time = start_time + pd.Timedelta(seconds=30)
-                            print(f"    [エフォート確定] start時刻: {start_time}, FPが見つかりません。startから30秒後まで: {end_time}")
                             
                             # startから30秒後までの間にあるすべてのデータポイントを取得
                             mask = (group_sorted_all["timestamp"] >= start_time) & (group_sorted_all["timestamp"] <= end_time)
@@ -986,8 +1047,6 @@ class KPIPage(QWidget):
                             
                             # 辞書形式に変換
                             effort_data_points = effort_data.to_dict("records")
-                            
-                            print(f"    [データ取得] start: {start_time}, 終了時刻: {end_time}, データポイント数: {len(effort_data_points)}")
                             
                             start_date = zero_m_row.get("Date") if has_date else start_time
                             efforts.append({
@@ -1001,7 +1060,6 @@ class KPIPage(QWidget):
                         else:
                             # 最後のFPから30秒後までのデータをエフォートとして確定
                             end_time = last_fp_time + pd.Timedelta(seconds=30)
-                            print(f"    [エフォート確定] 最後のFP: {last_fp_time}, 終了時刻: {end_time} (最後のFPから30秒後)")
                             
                             # startからend_timeまでの間にあるすべてのデータポイントを取得
                             mask = (group_sorted_all["timestamp"] >= start_time) & (group_sorted_all["timestamp"] <= end_time)
@@ -1010,11 +1068,8 @@ class KPIPage(QWidget):
                             # 辞書形式に変換
                             effort_data_points = effort_data.to_dict("records")
                             
-                            print(f"    [データ取得] start: {start_time}, 終了時刻: {end_time}, データポイント数: {len(effort_data_points)}")
-                            
                             # エフォートを確定
                             start_date = zero_m_row.get("Date") if has_date else start_time
-                            print(f"    [エフォート確定] start時刻: {start_time}, データポイント数: {len(effort_data_points)}")
                             efforts.append({
                                 "player_name": player_name,
                                 "date": start_date,
@@ -1029,8 +1084,7 @@ class KPIPage(QWidget):
                         current_time = found_fp
         
         # エフォートごとにKPIを計算
-        print(f"[エフォート検出] 合計 {len(efforts)} 個のエフォートを検出しました")
-        print(f"[KPI計算] エフォートごとにKPIを計算します...")
+        print(f"[エフォート検出] 合計 {len(efforts)} 個のエフォートを検出")
         
         for effort_idx, effort in enumerate(efforts):
             if not effort.get("data_points"):
@@ -1043,25 +1097,10 @@ class KPIPage(QWidget):
                 continue
             
             # KPI列を計算
-            print(f"  [エフォート {effort_idx + 1}] KPI計算前のDataFrame列: {effort_df.columns.tolist()}")
             effort_df_with_kpi = self._calculate_kpi_for_effort(effort_df)
-            print(f"  [エフォート {effort_idx + 1}] KPI計算後のDataFrame列: {effort_df_with_kpi.columns.tolist()}")
             
             # 計算したKPI列を含むdata_pointsに更新
             effort["data_points"] = effort_df_with_kpi.to_dict("records")
-            
-            # 最初のレコードにKPI列が含まれているか確認
-            if effort["data_points"]:
-                first_record_keys = list(effort["data_points"][0].keys())
-                print(f"  [エフォート {effort_idx + 1}] data_points[0]のキー: {first_record_keys}")
-            
-            # KPI列のリストを取得してログ出力
-            kpi_cols = self._display_kpi_columns()
-            calculated_kpi_cols = [col for col in kpi_cols if col in effort_df_with_kpi.columns]
-            if calculated_kpi_cols:
-                print(f"  [エフォート {effort_idx + 1}] KPI列を計算しました: {', '.join(calculated_kpi_cols)}")
-            else:
-                print(f"  [エフォート {effort_idx + 1}] KPI列が計算されませんでした。期待されるKPI列: {kpi_cols}")
         
         # エフォートデータを保持
         self._efforts_data = efforts.copy() if efforts else []
@@ -1079,7 +1118,6 @@ class KPIPage(QWidget):
         
         # KPI列のリストを取得（現在のモードに基づく）
         kpi_cols = self._display_kpi_columns()
-        print(f"[エフォートテーブル更新] KPI列数: {len(kpi_cols)}, KPI列名: {kpi_cols}")
         
         # エフォートテーブルの列数を設定: 選手名、日時、[KPI列...]、周回数
         base_cols_before_kpi = 2  # 選手名、日時
@@ -1088,7 +1126,7 @@ class KPIPage(QWidget):
         self.effort_table.setColumnCount(total_cols)
         
         # ヘッダーラベルを設定
-        headers = ["選手名", "日時"] + kpi_cols + ["周回数"]
+        headers = ["PlayerName", "Date"] + kpi_cols + ["LapCount"]
         self.effort_table.setHorizontalHeaderLabels(headers)
         
         # ヘッダーのリサイズモードを設定（下のテーブルと同じ仕様）
@@ -1097,12 +1135,11 @@ class KPIPage(QWidget):
         
         # 列幅を設定
         default_width = 160
-        wider = {"選手名": 160, "日時": 180, "周回数": 80}
+        wider = {"PlayerName":220, "Date": 220, "LapCount": 80}
         for i, header in enumerate(headers):
             self.effort_table.setColumnWidth(i, wider.get(header, default_width))
         
         # エフォートテーブルを更新
-        print(f"[デバッグ] effortsの長さ: {len(efforts)}, _efforts_dataの長さ: {len(self._efforts_data)}")
         self.effort_table.setRowCount(len(efforts))
         for idx, effort in enumerate(efforts):
             # 選手名
@@ -1120,7 +1157,6 @@ class KPIPage(QWidget):
             # KPI列の値を表示
             if effort.get("data_points") and len(effort["data_points"]) > 0:
                 effort_df = pd.DataFrame(effort["data_points"])
-                print(f"  [エフォート {idx + 1}] DataFrame列: {effort_df.columns.tolist()}")
                 
                 for kpi_idx, kpi_col in enumerate(kpi_cols):
                     col_idx = base_cols_before_kpi + kpi_idx
@@ -1128,25 +1164,19 @@ class KPIPage(QWidget):
                     if kpi_col in effort_df.columns:
                         # KPI列の値を取得（エフォート全体で計算された値）
                         kpi_values = pd.to_numeric(effort_df[kpi_col], errors='coerce')
-                        print(f"    [KPI列 {kpi_col}] 全値: {kpi_values.tolist()}")
                         # NaN以外の値を取得（通常は1つの値のはず）
                         valid_values = kpi_values.dropna()
-                        
-                        print(f"    [KPI列 {kpi_col}] 有効な値の数: {len(valid_values)}")
                         
                         if len(valid_values) > 0:
                             # 最初の有効な値を使用（通常は1つだけ）
                             kpi_value = valid_values.iloc[0]
                             # 小数点以下3桁で表示
                             kpi_str = f"{kpi_value:.3f}"
-                            print(f"    [KPI列 {kpi_col}] 表示値: {kpi_str}")
                         else:
                             kpi_str = ""
-                            print(f"    [KPI列 {kpi_col}] 値なし（NaN）")
                         
                         self.effort_table.setItem(idx, col_idx, QTableWidgetItem(kpi_str))
                     else:
-                        print(f"    [KPI列 {kpi_col}] DataFrameに列が存在しません。利用可能な列: {effort_df.columns.tolist()}")
                         self.effort_table.setItem(idx, col_idx, QTableWidgetItem(""))
             
             # 周回数（エフォート内の0mの回数をカウント）
@@ -1256,9 +1286,6 @@ class KPIPage(QWidget):
 
         # モード変更時はKPIを再計算してからテーブルを更新
         if hasattr(self, '_efforts_data') and self._efforts_data:
-            print(f"[モード変更] モード: {mode}, エフォート数: {len(self._efforts_data)}")
-            print(f"[モード変更] KPIを再計算します...")
-            
             for effort_idx, effort in enumerate(self._efforts_data):
                 if not effort.get("data_points"):
                     continue
@@ -1274,14 +1301,6 @@ class KPIPage(QWidget):
                 
                 # 計算したKPI列を含むdata_pointsに更新
                 effort["data_points"] = effort_df_with_kpi.to_dict("records")
-                
-                # KPI列のリストを取得してログ出力
-                kpi_cols = self._display_kpi_columns()
-                calculated_kpi_cols = [col for col in kpi_cols if col in effort_df_with_kpi.columns]
-                if calculated_kpi_cols:
-                    print(f"  [エフォート {effort_idx + 1}] KPI列を再計算しました: {', '.join(calculated_kpi_cols)}")
-            
-            print(f"[モード変更] KPI再計算完了")
 
         # エフォートテーブルも更新（KPI列が変わるため）
         self._update_effort_table_display()
@@ -1296,22 +1315,15 @@ class KPIPage(QWidget):
 
     # ---- リロード ----
     def _reload_kpi(self):
-        print("[KPI] リロード開始")
-
         # データを再読込
         self._load_data()
 
         # エフォート検出とテーブル更新
         self._detect_and_display_efforts()
 
-        print("[KPI] リロード完了")
-
     def _reload_kpi_json(self):
-        print("[KPI] kpi.json リロード開始")
-
         # KPI計算はエフォートごとに行うため、ここでは不要
-
-        print("[KPI] kpi.json リロード完了")
+        pass
 
     def _open_kpi_json_editor(self):
         """kpi.json編集ページへ遷移"""
@@ -1328,11 +1340,6 @@ class KPIPage(QWidget):
         
         row_idx = selected_rows[0].row()
         
-        # デバッグ情報を出力
-        efforts_data_len = len(getattr(self, '_efforts_data', []))
-        table_row_count = self.effort_table.rowCount()
-        print(f"[デバッグ] 選択された行: {row_idx}, テーブル行数: {table_row_count}, _efforts_dataの長さ: {efforts_data_len}")
-        
         if not hasattr(self, '_efforts_data') or not self._efforts_data:
             QMessageBox.warning(self, "エラー", "エフォートデータが読み込まれていません")
             return
@@ -1341,7 +1348,7 @@ class KPIPage(QWidget):
             QMessageBox.warning(
                 self, 
                 "エラー", 
-                f"無効な行が選択されています\n行: {row_idx}\nデータ数: {len(self._efforts_data)}\nテーブル行数: {table_row_count}"
+                f"無効な行が選択されています\n行: {row_idx}\nデータ数: {len(self._efforts_data)}"
             )
             return
         
